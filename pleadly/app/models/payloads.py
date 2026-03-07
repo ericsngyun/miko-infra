@@ -281,12 +281,12 @@ class SOLPayload(BaseModel):
     jurisdiction: str
     case_type: str = Field(alias="caseType")
     incident_date: str = Field(alias="incidentDate")
-    client_dob: str | None = Field(alias="clientDob")
-    defendant_type: str | None = Field(alias="defendantType")
-    is_minor: bool = Field(alias="isMinor")
-    government_entity: bool = Field(alias="governmentEntity")
-    discovery_date: str | None = Field(alias="discoveryDate")
-    additional_facts: str | None = Field(alias="additionalFacts")
+    client_dob: str | None = Field(default=None, alias="clientDob")
+    defendant_type: str | None = Field(default=None, alias="defendantType")
+    is_minor: bool = Field(default=False, alias="isMinor")
+    government_entity: bool = Field(default=False, alias="governmentEntity")
+    discovery_date: str | None = Field(default=None, alias="discoveryDate")
+    additional_facts: str | None = Field(default=None, alias="additionalFacts")
 
 
 class SOLResult(BaseModel):
