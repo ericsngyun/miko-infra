@@ -114,6 +114,7 @@ class OllamaClient:
         timeout: float | None = None,
         temperature: float = 0.6,
         max_retries: int = MAX_RETRIES,
+        think: bool = False,
     ) -> str:
         """
         Send a chat completion request to llama-server.
@@ -121,8 +122,10 @@ class OllamaClient:
         Args:
             prompt: The user message.
             model: Model label (informational only — llama-server ignores it).
-            system: Optional system prompt. Inject /no_think here for
-                    non-reasoning Pleadly stages.
+            system: Optional system prompt.
+            think: If True, enables Qwen3.5 reasoning mode for this request.
+                   Default False (thinking disabled globally at server level).
+                   Set True only for Legal Planner weakness analysis pass.
             json_mode: If True, request JSON output format.
             timeout: Per-request timeout in seconds.
             temperature: Sampling temperature (default 0.6 per Qwen3 recommendation).
@@ -147,6 +150,8 @@ class OllamaClient:
         }
         if json_mode:
             request_body["response_format"] = {"type": "json_object"}
+        if think:
+            request_body["chat_template_kwargs"] = {"enable_thinking": True}
 
         request_timeout = timeout or self.default_timeout
         last_error: Exception | None = None
