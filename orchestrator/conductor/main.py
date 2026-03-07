@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from db import close_pool
 from health import down_services, poll_all
+from spend_governor import check_all_spend
 from settings import settings
 from telegram_bot import ConductorBot
 
@@ -75,6 +76,28 @@ async def daily_brief_job() -> None:
     await bot.alert("info", "\n".join(lines))
 
 
+
+async def spend_poll_job() -> None:
+    """Check all project spend and alert via Telegram if thresholds breached."""
+    results = await check_all_spend()
+    for r in results:
+        if r["pct"] >= 100:
+            await bot.alert(
+                "critical",
+                f"*SPEND CAP EXCEEDED*\n"
+                f"Project: `{r['name']}`\n"
+                f"Spent: ${r['usd']:.2f} / ${r['cap']:.2f} ({r['pct']:.0f}%)\n"
+                f"Action: outbound calls halted",
+            )
+        elif r["pct"] >= 80:
+            await bot.alert(
+                "warning",
+                f"*Spend warning*\n"
+                f"Project: `{r['name']}`\n"
+                f"Spent: ${r['usd']:.2f} / ${r['cap']:.2f} ({r['pct']:.0f}%)",
+            )
+
+
 async def main() -> None:
     logger.info("Starting master-conductor")
 
@@ -98,6 +121,12 @@ async def main() -> None:
         hour=8,
         minute=0,
         id="daily_brief",
+    )
+    scheduler.add_job(
+        spend_poll_job,
+        "interval",
+        minutes=15,
+        id="spend_poll",
     )
     scheduler.start()
     logger.info(
