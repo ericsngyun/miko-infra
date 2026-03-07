@@ -36,3 +36,4 @@ Thumbs.db
 node_modules/
 .runtime-env/
 *.bak*
+.secrets.shared.prod.yaml
