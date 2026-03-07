@@ -80,18 +80,21 @@ class OllamaClient:
         """
         try:
             client = await self._get_client()
-            response = await client.get("/api/tags", timeout=5.0)
+            response = await client.get("/health", timeout=5.0)
             return response.status_code == 200
         except (httpx.HTTPError, Exception):
             return False
 
     async def list_models(self) -> list[dict[str, Any]]:
         """List available models on the Ollama instance."""
-        client = await self._get_client()
-        response = await client.get("/api/tags")
-        response.raise_for_status()
-        data = response.json()
-        return data.get("models", [])
+        try:
+            client = await self._get_client()
+            response = await client.get("/api/tags")
+            if response.status_code == 200:
+                return response.json().get("models", [])
+        except Exception:
+            pass
+        return []
 
     async def chat(
         self,
@@ -144,22 +147,60 @@ class OllamaClient:
         for attempt in range(max_retries):
             try:
                 client = await self._get_client()
+                # Build llama-server /completion request
+                system_content = ""
+                user_content = prompt
+                for msg in request_body.get("messages", []):
+                    if msg["role"] == "system":
+                        system_content = msg["content"]
+                    elif msg["role"] == "user":
+                        user_content = msg["content"]
+
+                if system_content:
+                    full_prompt = (
+                        f"<|im_start|>system\n{system_content}<|im_end|>\n"
+                        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    )
+                else:
+                    full_prompt = (
+                        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    )
+
+                completion_body = {
+                    "prompt": full_prompt,
+                    "n_predict": 4096,
+                    "stream": False,
+                    "temperature": request_body.get("options", {}).get("temperature", 0.1),
+                    "cache_prompt": False,
+                    "stop": ["<|im_end|>", "<|im_start|>"],
+                }
+                if request_body.get("format") == "json":
+                    completion_body["json_schema"] = {"type": "object"}
+
                 response = await client.post(
-                    "/api/chat",
-                    json=request_body,
+                    "/completion",
+                    json=completion_body,
                     timeout=request_timeout,
                 )
 
                 if response.status_code != 200:
-                    error_text = response.text
-                    # Don't log error_text as it may contain PII echoed back
                     raise OllamaError(
-                        f"Ollama returned status {response.status_code}",
+                        f"llama-server returned status {response.status_code}",
                         status_code=response.status_code,
                     )
 
                 data = response.json()
-                content = data.get("message", {}).get("content", "")
+                content = data.get("content", "").strip()
+                # Strip thinking tokens if present
+                if "<think>" in content:
+                    think_end = content.find("</think>")
+                    if think_end != -1:
+                        content = content[think_end + 8:].strip()
+                    else:
+                        # thinking incomplete - strip everything after <think>
+                        content = content[:content.find("<think>")].strip()
                 return content
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
