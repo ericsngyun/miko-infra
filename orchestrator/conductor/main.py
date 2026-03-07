@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from db import close_pool
+from db import close_pool, log_health
 from health import down_services, poll_all
 from spend_governor import check_all_spend
 from settings import settings
@@ -34,6 +34,10 @@ async def health_poll_job() -> None:
     global _previously_down
     results = await poll_all()
     down = {r.service for r in down_services(results)}
+
+    # Persist all results to health_log
+    for r in results:
+        await log_health(r.service, r.project, r.status)
 
     for svc in down - _previously_down:
         logger.error("SERVICE DOWN: %s", svc)
@@ -74,7 +78,6 @@ async def daily_brief_job() -> None:
             lines.append(f"  • `{r.service}`")
 
     await bot.alert("info", "\n".join(lines))
-
 
 
 async def spend_poll_job() -> None:

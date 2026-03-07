@@ -8,18 +8,35 @@ import logging
 
 import httpx
 
+from db import get_pool
 from settings import settings
 
 logger = logging.getLogger("conductor.spend")
 
 # Project spend endpoints and their daily caps
 PROJECTS = [
-    {
-        "name": "pleadly",
-        "url": "http://pleadly-api:8300/spend",
-        "cap_usd": settings.spend_cap_pleadly,
-    },
+    {"name": "pleadly", "url": "http://pleadly-api:8300/spend", "cap_usd": settings.spend_cap_pleadly},
+    {"name": "awaas",   "url": "http://awaas-api:8002/spend",   "cap_usd": settings.spend_cap_awaas},
+    {"name": "trading", "url": "http://trading-api:8003/spend", "cap_usd": settings.spend_cap_trading},
 ]
+
+
+async def _spend_from_log(project_name: str) -> float:
+    """Sum today's spend_log entries for a project as fallback."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT COALESCE(SUM(cost_usd), 0) AS total
+                FROM spend_log sl
+                JOIN projects p ON p.id = sl.project_id
+                WHERE p.name = $1
+                  AND sl.ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+            """, project_name)
+            return float(row["total"])
+    except Exception as exc:
+        logger.error("Failed to read spend_log for %s: %s", project_name, exc)
+        return 0.0
 
 
 async def check_all_spend() -> list[dict]:
@@ -36,8 +53,11 @@ async def check_all_spend() -> list[dict]:
                     logger.warning("Spend check failed for %s: HTTP %s", project["name"], resp.status_code)
                     continue
             except Exception as exc:
-                logger.warning("Spend check error for %s: %s", project["name"], exc)
-                continue
+                logger.warning(
+                    "Spend endpoint unreachable for %s: %s — falling back to spend_log",
+                    project["name"], exc,
+                )
+                usd = await _spend_from_log(project["name"])
 
             cap = project["cap_usd"]
             pct = (usd / cap * 100) if cap > 0 else 0
