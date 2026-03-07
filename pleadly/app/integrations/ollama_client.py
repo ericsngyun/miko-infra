@@ -1,8 +1,9 @@
 """
-Ollama API client for chat completions.
+llama-server API client for chat completions.
 
-Supports qwen3:30b-a3b (primary) and qwen2.5:1.5b (classifier/grader).
-Uses httpx for HTTP calls with retry logic and timeout handling.
+Targets Lemonade llamacpp-rocm (b1195+) running on port 11435.
+Uses /v1/chat/completions (OpenAI-compatible) wire format.
+Supports qwen3.5-35b-a3b (primary) and qwen3.5-2b (classifier).
 """
 
 from __future__ import annotations
@@ -17,21 +18,23 @@ import httpx
 
 logger = logging.getLogger("pleadly.ollama")
 
-# Model aliases
-MODEL_PRIMARY = "qwen3:30b-a3b"
-MODEL_CLASSIFIER = "qwen3:1.7b"
+# Model aliases — updated for Qwen3.5 stack
+# llama-server ignores the model field, these are labels only
+MODEL_PRIMARY    = "qwen3.5-35b-a3b"
+MODEL_CLASSIFIER = "qwen3.5-2b"
 
-# Default Ollama API endpoint
-DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+# llama-server base URL (v1 prefix for OpenAI-compat)
+_RAW_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
+DEFAULT_BASE_URL = _RAW_URL.rstrip("/")
 
 # Retry configuration
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 1.0  # seconds
-RETRY_MAX_DELAY = 30.0  # seconds
+MAX_RETRIES     = 3
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY  = 30.0
 
 
 class OllamaError(Exception):
-    """Raised when Ollama API returns an error."""
+    """Raised when llama-server returns an error."""
 
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
@@ -40,7 +43,7 @@ class OllamaError(Exception):
 
 class OllamaClient:
     """
-    Async wrapper around the Ollama HTTP API.
+    Async wrapper around llama-server's OpenAI-compatible HTTP API.
 
     Usage:
         client = OllamaClient()
@@ -49,7 +52,7 @@ class OllamaClient:
 
     def __init__(
         self,
-        base_url: str = DEFAULT_OLLAMA_URL,
+        base_url: str = DEFAULT_BASE_URL,
         default_timeout: float = 120.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -57,7 +60,6 @@ class OllamaClient:
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Lazily initialize the httpx async client."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
@@ -66,35 +68,41 @@ class OllamaClient:
         return self._client
 
     async def close(self) -> None:
-        """Close the underlying HTTP client."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
 
     async def health_check(self) -> bool:
-        """
-        Check if Ollama is reachable and responding.
-
-        Returns:
-            True if Ollama is healthy, False otherwise.
-        """
+        """Check if llama-server is reachable."""
         try:
             client = await self._get_client()
             response = await client.get("/health", timeout=5.0)
             return response.status_code == 200
-        except (httpx.HTTPError, Exception):
+        except Exception:
             return False
 
     async def list_models(self) -> list[dict[str, Any]]:
-        """List available models on the Ollama instance."""
+        """List models via OpenAI-compat endpoint."""
         try:
             client = await self._get_client()
-            response = await client.get("/api/tags")
+            response = await client.get("/v1/models")
             if response.status_code == 200:
-                return response.json().get("models", [])
+                return response.json().get("data", [])
         except Exception:
             pass
         return []
+
+    @staticmethod
+    def _extract_content(data: dict[str, Any]) -> str:
+        """
+        Extract clean content from /v1/chat/completions response.
+        reasoning_content (thinking tokens) is intentionally discarded —
+        Pleadly pipeline only needs the final output.
+        """
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError) as exc:
+            raise OllamaError(f"Unexpected response structure: {exc}")
 
     async def chat(
         self,
@@ -104,23 +112,24 @@ class OllamaClient:
         system: str | None = None,
         json_mode: bool = False,
         timeout: float | None = None,
-        temperature: float = 0.1,
+        temperature: float = 0.6,
         max_retries: int = MAX_RETRIES,
     ) -> str:
         """
-        Send a chat completion request to Ollama.
+        Send a chat completion request to llama-server.
 
         Args:
             prompt: The user message.
-            model: Model name (default: qwen3:30b-a3b).
-            system: Optional system prompt.
+            model: Model label (informational only — llama-server ignores it).
+            system: Optional system prompt. Inject /no_think here for
+                    non-reasoning Pleadly stages.
             json_mode: If True, request JSON output format.
-            timeout: Per-request timeout in seconds (overrides default).
-            temperature: Sampling temperature.
-            max_retries: Number of retries on transient failures.
+            timeout: Per-request timeout in seconds.
+            temperature: Sampling temperature (default 0.6 per Qwen3 recommendation).
+            max_retries: Retry count on transient failures.
 
         Returns:
-            The assistant's response text.
+            The assistant's response text (thinking tokens stripped).
 
         Raises:
             OllamaError: If the request fails after all retries.
@@ -134,12 +143,10 @@ class OllamaClient:
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-            },
+            "temperature": temperature,
         }
         if json_mode:
-            request_body["format"] = "json"
+            request_body["response_format"] = {"type": "json_object"}
 
         request_timeout = timeout or self.default_timeout
         last_error: Exception | None = None
@@ -147,75 +154,29 @@ class OllamaClient:
         for attempt in range(max_retries):
             try:
                 client = await self._get_client()
-                # Build llama-server /completion request
-                system_content = ""
-                user_content = prompt
-                for msg in request_body.get("messages", []):
-                    if msg["role"] == "system":
-                        system_content = msg["content"]
-                    elif msg["role"] == "user":
-                        user_content = msg["content"]
-
-                if system_content:
-                    full_prompt = (
-                        f"<|im_start|>system\n{system_content}<|im_end|>\n"
-                        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                        f"<|im_start|>assistant\n"
-                    )
-                else:
-                    full_prompt = (
-                        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                        f"<|im_start|>assistant\n"
-                    )
-
-                completion_body = {
-                    "prompt": full_prompt,
-                    "n_predict": 4096,
-                    "stream": False,
-                    "temperature": request_body.get("options", {}).get("temperature", 0.1),
-                    "cache_prompt": False,
-                    "stop": ["<|im_end|>", "<|im_start|>"],
-                }
-                if request_body.get("format") == "json":
-                    completion_body["json_schema"] = {"type": "object"}
-
                 response = await client.post(
-                    "/completion",
-                    json=completion_body,
+                    "/v1/chat/completions",
+                    json=request_body,
                     timeout=request_timeout,
                 )
 
                 if response.status_code != 200:
                     raise OllamaError(
-                        f"llama-server returned status {response.status_code}",
+                        f"llama-server returned status {response.status_code}: "
+                        f"{response.text[:200]}",
                         status_code=response.status_code,
                     )
 
-                data = response.json()
-                content = data.get("content", "").strip()
-                # Strip thinking tokens if present
-                if "<think>" in content:
-                    think_end = content.find("</think>")
-                    if think_end != -1:
-                        content = content[think_end + 8:].strip()
-                    else:
-                        # thinking incomplete - strip everything after <think>
-                        content = content[:content.find("<think>")].strip()
-                return content
+                return self._extract_content(response.json())
 
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_error = exc
                 if attempt < max_retries - 1:
-                    delay = min(
-                        RETRY_BASE_DELAY * (2**attempt),
-                        RETRY_MAX_DELAY,
-                    )
+                    delay = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
                     logger.warning(
-                        "Ollama request attempt %d/%d failed (timeout/connect), "
-                        "retrying in %.1fs",
-                        attempt + 1,
-                        max_retries,
-                        delay,
+                        "llama-server request attempt %d/%d failed (timeout/connect), "
+                        "retrying in %.1fs: %s",
+                        attempt + 1, max_retries, delay, exc,
                     )
                     await asyncio.sleep(delay)
             except OllamaError:
@@ -223,20 +184,15 @@ class OllamaClient:
             except Exception as exc:
                 last_error = exc
                 if attempt < max_retries - 1:
-                    delay = min(
-                        RETRY_BASE_DELAY * (2**attempt),
-                        RETRY_MAX_DELAY,
-                    )
+                    delay = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
                     logger.warning(
-                        "Ollama request attempt %d/%d failed, retrying in %.1fs",
-                        attempt + 1,
-                        max_retries,
-                        delay,
+                        "llama-server request attempt %d/%d failed, retrying in %.1fs: %s",
+                        attempt + 1, max_retries, delay, exc,
                     )
                     await asyncio.sleep(delay)
 
         raise OllamaError(
-            f"Ollama request failed after {max_retries} attempts: {last_error}"
+            f"llama-server request failed after {max_retries} attempts: {last_error}"
         )
 
     async def chat_json(
@@ -246,15 +202,10 @@ class OllamaClient:
         model: str = MODEL_PRIMARY,
         system: str | None = None,
         timeout: float | None = None,
-        temperature: float = 0.1,
+        temperature: float = 0.6,
     ) -> dict[str, Any]:
         """
         Send a chat request and parse the response as JSON.
-
-        Convenience wrapper around chat() with json_mode=True.
-
-        Returns:
-            Parsed JSON dictionary.
 
         Raises:
             OllamaError: If the request fails.
@@ -277,13 +228,13 @@ class OllamaClient:
         model: str = MODEL_PRIMARY,
         system: str | None = None,
         timeout: float | None = None,
-        temperature: float = 0.1,
+        temperature: float = 0.6,
     ) -> AsyncIterator[str]:
         """
-        Send a streaming chat completion request to Ollama.
+        Send a streaming chat completion request.
 
         Yields:
-            Content tokens as they arrive.
+            Content tokens as they arrive (thinking tokens skipped).
 
         Raises:
             OllamaError: If the request fails.
@@ -297,33 +248,50 @@ class OllamaClient:
             "model": model,
             "messages": messages,
             "stream": True,
-            "options": {
-                "temperature": temperature,
-            },
+            "temperature": temperature,
         }
 
-        request_timeout = timeout or self.default_timeout
-
         client = await self._get_client()
+        in_thinking = False
+
         async with client.stream(
             "POST",
-            "/api/chat",
+            "/v1/chat/completions",
             json=request_body,
-            timeout=request_timeout,
+            timeout=timeout or self.default_timeout,
         ) as response:
             if response.status_code != 200:
                 raise OllamaError(
-                    f"Ollama returned status {response.status_code}",
+                    f"llama-server returned status {response.status_code}",
                     status_code=response.status_code,
                 )
 
             async for line in response.aiter_lines():
-                if not line.strip():
+                if not line.startswith("data: "):
                     continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    break
                 try:
-                    chunk = json.loads(line)
-                    content = chunk.get("message", {}).get("content", "")
-                    if content:
-                        yield content
-                except json.JSONDecodeError:
+                    chunk = json.loads(payload)
+                    delta = chunk["choices"][0].get("delta", {})
+
+                    # Skip reasoning_content tokens entirely
+                    if delta.get("reasoning_content"):
+                        continue
+
+                    content = delta.get("content", "")
+                    if not content:
+                        continue
+
+                    # Guard against thinking tokens leaking into content stream
+                    if "<think>" in content:
+                        in_thinking = True
+                    if in_thinking:
+                        if "</think>" in content:
+                            in_thinking = False
+                        continue
+
+                    yield content
+                except (json.JSONDecodeError, KeyError):
                     continue

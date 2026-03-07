@@ -51,6 +51,7 @@ async def generate_demand(payload: DemandPayload) -> DemandResult:
 
     # Build context for demand letter
     jurisdiction = payload.firm_context.jurisdiction or "California"
+    firm_name = payload.firm_context.firm_name or "Our Law Firm"
     case_name = (
         payload.firm_context.case_context.case_name
         if payload.firm_context.case_context
@@ -107,6 +108,8 @@ Create a professional demand letter with these sections:
    - Consequence of non-response
 
 Use professional, persuasive language. Cite specific facts from the case summaries.
+Close the letter with "Sincerely," on its own line, then "[Attorney Name]" on the next line,
+then the actual firm name from the FIRM NAME field. Do not write [Your Law Firm] or [Your Contact Information].
 Return the letter as JSON with these fields:
 {{
   "letterText": "full letter text in markdown format",
@@ -131,6 +134,7 @@ Return the letter as JSON with these fields:
 
     user_prompt = f"""/no_think
 
+FIRM NAME: {firm_name}
 CASE: {case_name}
 CLIENT: {client_name}
 ACCIDENT DATE: {accident_date}
