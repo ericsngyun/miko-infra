@@ -224,7 +224,14 @@ class OllamaClient:
             timeout=timeout,
             temperature=temperature,
         )
-        return json.loads(raw)
+        # Strip markdown code fences if model wraps JSON despite json_mode
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```", 2)[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.rsplit("```", 1)[0].strip()
+        return json.loads(clean)
 
     async def chat_stream(
         self,
