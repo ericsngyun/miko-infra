@@ -47,7 +47,9 @@ async def _ensure_schema() -> None:
                 chat_id       BIGINT PRIMARY KEY,
                 username      TEXT,
                 registered_at TIMESTAMPTZ DEFAULT NOW(),
-                active        BOOLEAN DEFAULT TRUE
+                active        BOOLEAN DEFAULT TRUE,
+                role          TEXT NOT NULL DEFAULT 'principal',
+                domain        TEXT[]
             )
         """)
         await conn.execute("""
@@ -133,3 +135,19 @@ async def close_pool() -> None:
     if _pool:
         await _pool.close()
         _pool = None
+
+
+async def get_chat_ids_with_roles() -> list[dict]:
+    """Load all active principals with their roles from postgres."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT chat_id, username, role, domain
+                FROM conductor_chat_ids
+                WHERE active = TRUE
+            """)
+            return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("Failed to load principals: %s", exc)
+        return []

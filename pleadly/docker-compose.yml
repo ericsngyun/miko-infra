@@ -78,7 +78,7 @@ services:
     volumes:
       - ./app:/app:ro
     environment:
-      - OLLAMA_URL=http://172.23.0.1:11434
+      - OLLAMA_URL=http://172.23.0.1:11435
       - REDIS_URL=redis://redis:6379
       - POSTGRES_DSN=postgresql://${PLEADLY_PG_USER}:${PLEADLY_PG_PASSWORD}@pleadly-postgres:5432/${PLEADLY_PG_DATABASE}
       - QDRANT_URL=http://pleadly-qdrant:6333
