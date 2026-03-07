@@ -86,6 +86,7 @@ async def chat(
                     "model": settings.chat_model,
                     "messages": messages,
                     "stream": False,
+                    "think": False,
                     "options": {
                         "num_predict": 512,
                         "temperature": 0.7,

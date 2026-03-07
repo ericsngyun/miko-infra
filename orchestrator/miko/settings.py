@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # Ollama
     ollama_url: str = "http://host-gateway:11434"
-    chat_model: str = "qwen3:1.7b"
+    chat_model: str = "qwen3.5:4b"
 
     # Qdrant (for Mem0)
     qdrant_url: str = "http://awaas-qdrant:6333"
