@@ -34,3 +34,5 @@ Thumbs.db
 
 # Node
 node_modules/
+.runtime-env/
+*.bak*
