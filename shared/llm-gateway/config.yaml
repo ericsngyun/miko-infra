@@ -1,0 +1,65 @@
+# LLM Gateway Config — AWaaS Node 1
+# Port 11435 (internal). Ollama stays on 11434 for direct benchmarks.
+server:
+  port: 11435
+  host: "0.0.0.0"
+
+backends:
+  local:
+    url: "http://ollama:11434"
+    type: "ollama"
+    models: ["qwen3:30b-a3b", "qwen2.5:1.5b", "nomic-embed-text"]
+  anthropic:
+    url: "https://api.anthropic.com/v1"
+    type: "anthropic"
+    api_key_env: "ANTHROPIC_API_KEY"
+  openai:
+    url: "https://api.openai.com/v1"
+    type: "openai"
+    api_key_env: "OPENAI_API_KEY"
+  gemini:
+    url: "https://generativelanguage.googleapis.com/v1beta"
+    type: "gemini"
+    api_key_env: "GEMINI_API_KEY"
+
+stacks:
+  pleadly:
+    data_class: "PRIVILEGED"
+    routing: "local_only"
+    cloud_fallback: false
+    daily_token_budget: 5000000
+    redact_payloads: true
+  orchestrator:
+    data_class: "CONFIDENTIAL"
+    routing: "local_preferred"
+    cloud_fallback: true
+    daily_spend_cap_usd: 30
+  awaas_services:
+    data_class: "CONFIDENTIAL"
+    routing: "local_preferred"
+    cloud_fallback: true
+    daily_spend_cap_usd: 50
+  trading:
+    data_class: "INTERNAL"
+    routing: "cloud_allowed"
+    daily_spend_cap_usd: 10
+
+semaphore:
+  PRIVILEGED:  { max_concurrent: 2, overflow: "reject_429" }
+  CONFIDENTIAL: { max_concurrent: 3, overflow: "queue", queue_timeout_s: 600 }
+  INTERNAL:    { max_concurrent: 2, overflow: "unlimited_queue" }
+
+policy:
+  privileged_cloud_violation:
+    action: "reject"
+    severity: "CRITICAL"
+    audit: true
+    telegram_alert: true
+
+audit:
+  pre_call_audit: true
+  file_path: "/mnt/audit/logs/inference.jsonl"
+
+spend:
+  warn_threshold_pct: 80
+  hard_pause_pct: 100

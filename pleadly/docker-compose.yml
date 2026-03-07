@@ -1,0 +1,166 @@
+# pleadly/docker-compose.yml — PRIVILEGED data class (attorney-client privilege)
+# Deploy: Day 3
+# Gate: AWaaS API key rejected by Pleadly Qdrant (403). Cross-login fails.
+#       PRIVILEGED inference via LLM Gateway → local only + CRITICAL audit.
+name: awaas-pleadly
+
+services:
+  pleadly-postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: pleadly-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${PLEADLY_PG_USER}
+      - POSTGRES_PASSWORD=${PLEADLY_PG_PASSWORD}
+      - POSTGRES_DB=${PLEADLY_PG_DATABASE}
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c work_mem=8MB
+      -c maintenance_work_mem=128MB
+      -c wal_level=replica
+      -c max_wal_size=512MB
+    volumes:
+      - pleadly-pg-data:/var/lib/postgresql/data
+    networks:
+      - pleadly-net
+    # Port 5433 internal only — isolated from all other stacks
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    shm_size: '256mb'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PLEADLY_PG_USER} -d ${PLEADLY_PG_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pleadly-qdrant:
+    image: ${QDRANT_IMAGE}
+    container_name: pleadly-qdrant
+    restart: unless-stopped
+    environment:
+      - QDRANT__SERVICE__API_KEY=${PLEADLY_QDRANT_API_KEY}
+      - QDRANT__STORAGE__STORAGE_PATH=/qdrant/storage
+    volumes:
+      - pleadly-qdrant-data:/qdrant/storage
+    networks:
+      - pleadly-net
+    # Dedicated instance — AWaaS API key MUST be rejected (Gate G1)
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETUID, SETGID]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  pleadly-api:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: pleadly-api
+    ports:
+      - "8300:8300"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8300"]
+    working_dir: /app
+    volumes:
+      - ./app:/app:ro
+    environment:
+      - OLLAMA_URL=http://172.23.0.1:11434
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_DSN=postgresql://${PLEADLY_PG_USER}:${PLEADLY_PG_PASSWORD}@pleadly-postgres:5432/${PLEADLY_PG_DATABASE}
+      - QDRANT_URL=http://pleadly-qdrant:6333
+      - QDRANT_API_KEY=${PLEADLY_QDRANT_API_KEY}
+      - PLEADLY_HMAC_SECRET=${PLEADLY_HMAC_SECRET}
+      - DATA_CLASS=PRIVILEGED
+    networks:
+      - pleadly-net
+      - shared-net          # needs LLM Gateway
+    depends_on:
+      pleadly-postgres:
+        condition: service_healthy
+      pleadly-qdrant:
+        condition: service_started
+    security_opt:
+      - apparmor:docker-default
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    user: "1000:1000"
+
+  pleadly-n8n:
+    image: ${N8N_IMAGE}
+    container_name: pleadly-n8n
+    restart: unless-stopped
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=pleadly-postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${PLEADLY_PG_DATABASE}
+      - DB_POSTGRESDB_USER=${PLEADLY_PG_USER}
+      - DB_POSTGRESDB_PASSWORD=${PLEADLY_PG_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${PLEADLY_N8N_ENCRYPTION_KEY}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://pleadly-n8n.awaas-node1.tail-net
+      - EXECUTIONS_MODE=regular
+      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+      - N8N_RUNNERS_ENABLED=true
+      # n8n 2.x: task runners enabled by default (sandboxed code execution)
+      - NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.localFileTrigger"]
+    volumes:
+      - pleadly-n8n-data:/home/node/.n8n
+    networks:
+      - pleadly-net
+      - shared-net          # needs LLM Gateway for AI Agent nodes
+    depends_on:
+      pleadly-postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    user: "1000:1000"
+
+volumes:
+  pleadly-pg-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/pleadly-postgres
+  pleadly-qdrant-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/pleadly-qdrant
+  pleadly-n8n-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/pleadly-n8n
+
+networks:
+  pleadly-net:
+    name: awaas-pleadly
+    # ISOLATED: No cross-stack network path to awaas-services or trading
+  shared-net:
+    external: true
+    name: awaas-shared

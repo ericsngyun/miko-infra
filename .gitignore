@@ -1,0 +1,36 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.template
+*.age
+.age/
+
+# SOPS plaintext (encrypted .yaml files ARE committed)
+*.dec.yaml
+*.dec.yml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+*.jsonl
+
+# Node
+node_modules/

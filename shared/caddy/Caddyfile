@@ -1,0 +1,3 @@
+:80 {
+  respond "awaas node: caddy up ✅" 200
+}

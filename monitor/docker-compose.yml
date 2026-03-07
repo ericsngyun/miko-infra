@@ -1,0 +1,155 @@
+# monitor/docker-compose.yml — Observability stack
+# Deploy: Day 2 PM (second stack)
+# Gate: Grafana shows RAM%, iGPU CU%, Ollama queue. Test Telegram alert fires.
+name: awaas-monitor
+
+services:
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=90d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - monitor-net
+      - shared-net
+      - orchestrator-net
+      - pleadly-net
+      - awaas-net
+      - trading-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "9090:9090"
+    user: "65534:65534"
+
+  grafana:
+    image: ${GRAFANA_IMAGE}
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=https://grafana.awaas-node1.tail-net
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - monitor-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "3000:3000"
+    user: "472:472"
+
+  loki:
+    image: ${LOKI_IMAGE}
+    container_name: loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    networks:
+      - monitor-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "3100:3100"
+    user: "10001:10001"
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE}
+    container_name: alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - monitor-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    user: "65534:65534"
+
+  node-exporter:
+    image: ${NODE_EXPORTER_IMAGE}
+    container_name: node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - monitor-net
+    pid: host
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    user: "65534:65534"
+
+  cadvisor:
+    image: ${CADVISOR_IMAGE}
+    container_name: cadvisor
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - monitor-net
+    privileged: true           # required for cAdvisor
+    devices:
+      - /dev/kmsg:/dev/kmsg
+
+volumes:
+  prometheus-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/prometheus
+  grafana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/grafana
+  loki-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/loki
+
+networks:
+  monitor-net:
+    name: awaas-monitor
+  shared-net:
+    external: true
+    name: awaas-shared
+  orchestrator-net:
+    external: true
+    name: awaas-orchestrator
+  pleadly-net:
+    external: true
+    name: awaas-pleadly
+  awaas-net:
+    external: true
+    name: awaas-services
+  trading-net:
+    external: true
+    name: awaas-trading

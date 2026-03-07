@@ -1,0 +1,157 @@
+# orchestrator/docker-compose.yml — Brain stack
+# Deploy: Day 2 PM late (third stack, after monitor)
+# Gate: All 9 migrations run. miko_world_model has infra_state. Action Gateway /health 200.
+name: awaas-orchestrator
+
+services:
+  master-postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: master-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${MASTER_PG_USER}
+      - POSTGRES_PASSWORD=${MASTER_PG_PASSWORD}
+      - POSTGRES_DB=${MASTER_PG_DATABASE}
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c effective_cache_size=1536MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=256MB
+      -c wal_level=replica
+      -c max_wal_size=1GB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+    volumes:
+      - master-pg-data:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - orchestrator-net
+    # Port 5432 internal only — no host binding
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    shm_size: '512mb'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MASTER_PG_USER} -d ${MASTER_PG_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  master-conductor:
+    image: python:3.12-slim
+    container_name: master-conductor
+    restart: unless-stopped
+    command: ["python", "-m", "conductor.main"]
+    working_dir: /app
+    volumes:
+      - ./conductor:/app:ro
+    environment:
+      - PG_HOST=master-postgres
+      - PG_PORT=5432
+      - PG_USER=${MASTER_PG_USER}
+      - PG_PASSWORD=${MASTER_PG_PASSWORD}
+      - PG_DATABASE=${MASTER_PG_DATABASE}
+      - HEALTH_POLL_INTERVAL_S=300
+      - LLM_GATEWAY_URL=http://llm-gateway:11435
+    networks:
+      - orchestrator-net
+      - shared-net
+    depends_on:
+      master-postgres:
+        condition: service_healthy
+    security_opt:
+      - apparmor:docker-default
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    user: "1000:1000"
+
+  miko-api:
+    image: python:3.12-slim
+    container_name: miko-api
+    restart: unless-stopped
+    command: ["uvicorn", "miko.api:app", "--host", "0.0.0.0", "--port", "8100"]
+    working_dir: /app
+    volumes:
+      - ./miko:/app:ro
+    environment:
+      - PG_HOST=master-postgres
+      - PG_PORT=5432
+      - PG_USER=${MASTER_PG_USER}
+      - PG_PASSWORD=${MASTER_PG_PASSWORD}
+      - PG_DATABASE=${MASTER_PG_DATABASE}
+      - MIKO_API_KEY=${MIKO_API_KEY}
+      - LLM_GATEWAY_URL=http://llm-gateway:11435
+    networks:
+      - orchestrator-net
+      - shared-net
+    depends_on:
+      master-postgres:
+        condition: service_healthy
+    security_opt:
+      - apparmor:docker-default
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    user: "1000:1000"
+
+  action-gateway:
+    image: python:3.12-slim
+    container_name: action-gateway
+    restart: unless-stopped
+    command: ["uvicorn", "action_gateway.main:app", "--host", "0.0.0.0", "--port", "8200"]
+    working_dir: /app
+    volumes:
+      - ../awaas_services/action-gateway:/app:ro
+      - /mnt/audit/logs:/mnt/audit/logs
+    environment:
+      - PG_HOST=master-postgres
+      - PG_PORT=5432
+      - PG_USER=${MASTER_PG_USER}
+      - PG_PASSWORD=${MASTER_PG_PASSWORD}
+      - PG_DATABASE=${MASTER_PG_DATABASE}
+      - ACTION_GATEWAY_HMAC_KEY=${ACTION_GATEWAY_HMAC_KEY}
+    networks:
+      - orchestrator-net
+      - awaas-net
+    depends_on:
+      master-postgres:
+        condition: service_healthy
+    security_opt:
+      - apparmor:docker-default
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    user: "1000:1000"
+
+volumes:
+  master-pg-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/master-postgres
+
+networks:
+  orchestrator-net:
+    name: awaas-orchestrator
+  shared-net:
+    external: true
+    name: awaas-shared
+  awaas-net:
+    external: true
+    name: awaas-services
