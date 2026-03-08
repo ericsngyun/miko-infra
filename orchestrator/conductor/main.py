@@ -153,13 +153,12 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown, sig)
 
-    logger.info("master-conductor ready — starting Telegram polling")
+    logger.info("master-conductor ready — alert-only mode (no polling)")
     async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
+        await app.initialize()
+        await app.bot.get_me()  # verify token is valid
         await stop
-        await app.updater.stop()
-        await app.stop()
+        await app.shutdown()
 
     await close_pool()
     logger.info("master-conductor stopped cleanly")
