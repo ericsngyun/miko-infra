@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Miko</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,300&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0a0a0b;
+    --surface:   #111113;
+    --border:    #1e1e22;
+    --border-hi: #2e2e35;
+    --text:      #e2e2e6;
+    --text-dim:  #6b6b75;
+    --text-faint:#3a3a42;
+    --accent:    #7c6aff;
+    --accent-lo: rgba(124,106,255,0.08);
+    --accent-md: rgba(124,106,255,0.18);
+    --green:     #3ddc84;
+    --green-lo:  rgba(61,220,132,0.08);
+    --red:       #ff5f5f;
+    --amber:     #ffb347;
+    --mono:      'IBM Plex Mono', monospace;
+    --sans:      'IBM Plex Sans', sans-serif;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--mono); overflow: hidden; }
+
+  /* Layout */
+  .shell {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    height: 100vh;
+    max-width: 900px;
+    margin: 0 auto;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .header-left { display: flex; align-items: center; gap: 14px; }
+  .logo {
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    color: var(--text);
+  }
+  .logo span { color: var(--accent); }
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--text-faint);
+    transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  .status-dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.error  { background: var(--red); }
+
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .header-btn {
+    background: none; border: 1px solid var(--border-hi);
+    color: var(--text-dim); font-family: var(--mono);
+    font-size: 11px; padding: 5px 12px;
+    border-radius: 3px; cursor: pointer;
+    transition: all 0.15s; letter-spacing: 0.05em;
+  }
+  .header-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-lo); }
+  .user-select {
+    background: var(--surface); border: 1px solid var(--border-hi);
+    color: var(--text-dim); font-family: var(--mono); font-size: 11px;
+    padding: 5px 10px; border-radius: 3px; cursor: pointer;
+    outline: none; letter-spacing: 0.05em;
+  }
+  .user-select:focus { border-color: var(--accent); color: var(--text); }
+
+  /* Messages */
+  .messages {
+    overflow-y: auto;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    scroll-behavior: smooth;
+  }
+  .messages::-webkit-scrollbar { width: 4px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+  .msg {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 0;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    animation: fadeSlide 0.2s ease;
+  }
+  @keyframes fadeSlide {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.user { background: var(--bg); }
+  .msg.miko { background: var(--surface); }
+  .msg.system-msg { background: var(--bg); }
+
+  .msg-role {
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    padding-top: 2px;
+    flex-shrink: 0;
+  }
+  .msg.user  .msg-role { color: var(--accent); }
+  .msg.miko  .msg-role { color: var(--green); }
+  .msg.system-msg .msg-role { color: var(--text-faint); }
+
+  .msg-content {
+    font-size: 13.5px;
+    line-height: 1.75;
+    color: var(--text);
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+  .msg.system-msg .msg-content { color: var(--text-faint); font-size: 12px; font-style: italic; }
+
+  /* Typing indicator */
+  .typing { display: flex; gap: 4px; align-items: center; padding-top: 4px; }
+  .typing span {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--text-faint); animation: blink 1.2s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.3; }
+    40%            { opacity: 1; }
+  }
+
+  /* Status panel */
+  .status-panel {
+    display: none;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .status-panel.visible { display: flex; }
+  .status-item { display: flex; gap: 8px; align-items: center; }
+  .status-label { color: var(--text-faint); }
+  .status-value { color: var(--text-dim); }
+  .status-value.ok    { color: var(--green); }
+  .status-value.error { color: var(--red); }
+  .status-value.warn  { color: var(--amber); }
+
+  /* Input */
+  .input-area {
+    border-top: 1px solid var(--border);
+    padding: 16px 24px;
+    background: var(--bg);
+  }
+  .input-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
+    border-radius: 4px;
+    padding: 10px 14px;
+    transition: border-color 0.15s;
+  }
+  .input-row:focus-within { border-color: var(--accent); }
+
+  .input-prompt {
+    color: var(--accent);
+    font-size: 13px;
+    padding-bottom: 1px;
+    flex-shrink: 0;
+    user-select: none;
+  }
+  textarea {
+    flex: 1;
+    background: none; border: none; outline: none; resize: none;
+    color: var(--text); font-family: var(--mono); font-size: 13.5px;
+    line-height: 1.6; max-height: 140px; min-height: 22px;
+    caret-color: var(--accent);
+  }
+  textarea::placeholder { color: var(--text-faint); }
+
+  .send-btn {
+    background: var(--accent-lo); border: 1px solid var(--accent-md);
+    color: var(--accent); font-family: var(--mono); font-size: 11px;
+    padding: 6px 14px; border-radius: 3px; cursor: pointer;
+    transition: all 0.15s; letter-spacing: 0.06em; flex-shrink: 0;
+    align-self: flex-end;
+  }
+  .send-btn:hover:not(:disabled) { background: var(--accent-md); }
+  .send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  .input-meta {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 8px; padding: 0 2px;
+  }
+  .input-hint { font-size: 10.5px; color: var(--text-faint); }
+  .mem-indicator { font-size: 10.5px; color: var(--text-faint); }
+  .mem-indicator.active { color: var(--accent); }
+
+  /* Welcome */
+  .welcome {
+    flex: 1;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 40px; text-align: center; gap: 16px;
+    color: var(--text-faint);
+  }
+  .welcome-name {
+    font-size: 28px; font-weight: 300; letter-spacing: 0.2em;
+    color: var(--text-dim);
+  }
+  .welcome-name span { color: var(--accent); }
+  .welcome-sub { font-size: 12px; line-height: 1.8; max-width: 380px; }
+  .welcome-commands {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    justify-content: center; margin-top: 8px;
+  }
+  .cmd-chip {
+    font-size: 11px; padding: 4px 12px;
+    border: 1px solid var(--border-hi); border-radius: 2px;
+    color: var(--text-faint); cursor: pointer;
+    transition: all 0.15s;
+  }
+  .cmd-chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-lo); }
+
+  /* Memory panel */
+  .memory-drawer {
+    position: fixed; top: 0; right: -340px;
+    width: 340px; height: 100vh;
+    background: var(--surface); border-left: 1px solid var(--border);
+    transition: right 0.25s ease; z-index: 100;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .memory-drawer.open { right: 0; }
+  .memory-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .memory-title { font-size: 11px; letter-spacing: 0.1em; color: var(--text-dim); }
+  .memory-close {
+    background: none; border: none; color: var(--text-faint);
+    cursor: pointer; font-size: 16px; padding: 2px 6px;
+  }
+  .memory-close:hover { color: var(--text); }
+  .memory-list { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .memory-item {
+    font-size: 12px; line-height: 1.6; color: var(--text-dim);
+    padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 3px; background: var(--bg);
+  }
+  .memory-empty { font-size: 12px; color: var(--text-faint); font-style: italic; }
+
+  /* Scrollbar for memory */
+  .memory-list::-webkit-scrollbar { width: 3px; }
+  .memory-list::-webkit-scrollbar-thumb { background: var(--border-hi); }
+
+  /* Code blocks in miko responses */
+  .msg-content code {
+    background: rgba(124,106,255,0.1); padding: 1px 5px;
+    border-radius: 2px; font-size: 12.5px; color: #a99fff;
+  }
+  .msg-content pre {
+    background: #0d0d10; border: 1px solid var(--border);
+    padding: 12px; border-radius: 3px; overflow-x: auto;
+    margin: 8px 0; font-size: 12px; line-height: 1.6;
+  }
+  .msg-content pre code { background: none; padding: 0; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="status-dot" id="statusDot"></div>
+      <div class="logo">MI<span>K</span>O</div>
+    </div>
+    <div class="header-right">
+      <select class="user-select" id="userSelect">
+        <option value="eric">Eric</option>
+        <option value="david">David</option>
+      </select>
+      <button class="header-btn" id="statusBtn" onclick="toggleStatus()">status</button>
+      <button class="header-btn" onclick="toggleMemory()">memory</button>
+      <button class="header-btn" onclick="clearMessages()">clear</button>
+    </div>
+  </header>
+
+  <!-- Status panel -->
+  <div class="status-panel" id="statusPanel"></div>
+
+  <!-- Messages -->
+  <div class="messages" id="messages">
+    <div class="welcome" id="welcome">
+      <div class="welcome-name">MI<span>K</span>O</div>
+      <div class="welcome-sub">
+        Sharp, self-aware, and already briefed.<br>
+        Ask me anything — infrastructure, strategy, or whatever's on your mind.
+      </div>
+      <div class="welcome-commands">
+        <div class="cmd-chip" onclick="sendQuick('What\'s the status of Pleadly right now?')">pleadly status</div>
+        <div class="cmd-chip" onclick="sendQuick('What are the open sprint blockers?')">sprint blockers</div>
+        <div class="cmd-chip" onclick="sendQuick('Walk me through what we shipped today')">today\'s work</div>
+        <div class="cmd-chip" onclick="sendQuick('What\'s the next thing I should do?')">what\'s next</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-area">
+    <div class="input-row">
+      <span class="input-prompt">›</span>
+      <textarea
+        id="msgInput"
+        placeholder="Talk to Miko..."
+        rows="1"
+        onkeydown="handleKey(event)"
+        oninput="autoResize(this)"
+      ></textarea>
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">send</button>
+    </div>
+    <div class="input-meta">
+      <span class="input-hint">enter to send · shift+enter for newline</span>
+      <span class="mem-indicator" id="memIndicator">mem: —</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- Memory drawer -->
+<div class="memory-drawer" id="memoryDrawer">
+  <div class="memory-header">
+    <span class="memory-title">MEMORY</span>
+    <button class="memory-close" onclick="toggleMemory()">×</button>
+  </div>
+  <div class="memory-list" id="memoryList">
+    <span class="memory-empty">Loading memories...</span>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+let isLoading = false;
+let statusVisible = false;
+let memoryOpen = false;
+
+// Auto-resize textarea
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function getUserId() {
+  return document.getElementById('userSelect').value;
+}
+
+function sendQuick(text) {
+  document.getElementById('msgInput').value = text;
+  sendMessage();
+}
+
+// Render markdown-like formatting
+function renderContent(text) {
+  // Code blocks
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre><code>${escapeHtml(code.trim())}</code></pre>`
+  );
+  // Inline code
+  text = text.replace(/`([^`]+)`/g, (_, code) =>
+    `<code>${escapeHtml(code)}</code>`
+  );
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  return text;
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function addMessage(role, content, memCount) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const messages = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  const roleLabel = role === 'user' ? getUserId().toUpperCase() : 'MIKO';
+  const contentHtml = role === 'miko' ? renderContent(content) : escapeHtml(content);
+
+  div.innerHTML = `
+    <div class="msg-role">${roleLabel}</div>
+    <div class="msg-content">${contentHtml}</div>
+  `;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+
+  if (memCount !== undefined) {
+    const ind = document.getElementById('memIndicator');
+    ind.textContent = `mem: ${memCount}`;
+    ind.className = memCount > 0 ? 'mem-indicator active' : 'mem-indicator';
+  }
+}
+
+function addTyping() {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const messages = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg miko';
+  div.id = 'typing-indicator';
+  div.innerHTML = `
+    <div class="msg-role">MIKO</div>
+    <div class="msg-content"><div class="typing"><span></span><span></span><span></span></div></div>
+  `;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function removeTyping() {
+  const t = document.getElementById('typing-indicator');
+  if (t) t.remove();
+}
+
+async function sendMessage() {
+  if (isLoading) return;
+  const input = document.getElementById('msgInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  isLoading = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  addMessage('user', msg);
+  addTyping();
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: msg,
+        user_id: getUserId(),
+        include_status: false,
+      }),
+    });
+
+    removeTyping();
+
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    addMessage('miko', data.reply, data.memories_used);
+  } catch (err) {
+    removeTyping();
+    addMessage('miko', `Something went wrong: ${err.message}`, 0);
+  } finally {
+    isLoading = false;
+    document.getElementById('sendBtn').disabled = false;
+    input.focus();
+  }
+}
+
+function clearMessages() {
+  const messages = document.getElementById('messages');
+  messages.innerHTML = `
+    <div class="welcome" id="welcome">
+      <div class="welcome-name">MI<span>K</span>O</div>
+      <div class="welcome-sub">Sharp, self-aware, and already briefed.<br>Ask me anything — infrastructure, strategy, or whatever's on your mind.</div>
+      <div class="welcome-commands">
+        <div class="cmd-chip" onclick="sendQuick('What\\'s the status of Pleadly right now?')">pleadly status</div>
+        <div class="cmd-chip" onclick="sendQuick('What are the open sprint blockers?')">sprint blockers</div>
+        <div class="cmd-chip" onclick="sendQuick('Walk me through what we shipped today')">today's work</div>
+        <div class="cmd-chip" onclick="sendQuick('What\\'s the next thing I should do?')">what's next</div>
+      </div>
+    </div>
+  `;
+  document.getElementById('memIndicator').textContent = 'mem: —';
+  document.getElementById('memIndicator').className = 'mem-indicator';
+}
+
+// Status panel
+async function toggleStatus() {
+  statusVisible = !statusVisible;
+  const panel = document.getElementById('statusPanel');
+  if (!statusVisible) {
+    panel.classList.remove('visible');
+    return;
+  }
+  panel.classList.add('visible');
+  panel.innerHTML = '<div class="status-item"><span class="status-label">fetching...</span></div>';
+  try {
+    const resp = await fetch(`${API_BASE}/api/status`);
+    const data = await resp.json();
+    renderStatusPanel(data);
+  } catch (e) {
+    panel.innerHTML = `<div class="status-item"><span class="status-value error">unreachable</span></div>`;
+  }
+}
+
+function renderStatusPanel(data) {
+  const panel = document.getElementById('statusPanel');
+  const items = [];
+  if (data.reachable) {
+    items.push({ label: 'pleadly', value: 'online', cls: 'ok' });
+    if (data.health) {
+      const h = data.health;
+      if (h.status) items.push({ label: 'api', value: h.status, cls: h.status === 'ok' ? 'ok' : 'warn' });
+      if (h.model) items.push({ label: 'model', value: h.model });
+    }
+    if (data.spend) {
+      Object.entries(data.spend).slice(0, 3).forEach(([k, v]) => {
+        items.push({ label: k, value: String(v) });
+      });
+    }
+  } else {
+    items.push({ label: 'pleadly', value: 'unreachable', cls: 'error' });
+    if (data.error) items.push({ label: 'error', value: data.error.slice(0, 60) });
+  }
+  panel.innerHTML = items.map(i =>
+    `<div class="status-item">
+      <span class="status-label">${i.label}</span>
+      <span class="status-value ${i.cls || ''}">${i.value}</span>
+    </div>`
+  ).join('');
+}
+
+// Memory drawer
+async function toggleMemory() {
+  memoryOpen = !memoryOpen;
+  const drawer = document.getElementById('memoryDrawer');
+  if (memoryOpen) {
+    drawer.classList.add('open');
+    await loadMemories();
+  } else {
+    drawer.classList.remove('open');
+  }
+}
+
+async function loadMemories() {
+  const list = document.getElementById('memoryList');
+  list.innerHTML = '<span class="memory-empty">Loading...</span>';
+  try {
+    const resp = await fetch(`${API_BASE}/api/memories/${getUserId()}?query=everything`);
+    const data = await resp.json();
+    if (!data.memories || data.memories.length === 0) {
+      list.innerHTML = '<span class="memory-empty">No memories yet. Keep talking.</span>';
+      return;
+    }
+    list.innerHTML = data.memories.map(m =>
+      `<div class="memory-item">${escapeHtml(m)}</div>`
+    ).join('');
+  } catch (e) {
+    list.innerHTML = `<span class="memory-empty">Couldn't load memories: ${e.message}</span>`;
+  }
+}
+
+// Health check on load
+async function checkHealth() {
+  const dot = document.getElementById('statusDot');
+  try {
+    const resp = await fetch(`${API_BASE}/health`);
+    if (resp.ok) {
+      dot.classList.add('online');
+    } else {
+      dot.classList.add('error');
+    }
+  } catch {
+    dot.classList.add('error');
+  }
+}
+
+// Init
+document.getElementById('msgInput').focus();
+checkHealth();
+</script>
+</body>
+</html>

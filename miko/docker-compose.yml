@@ -1,0 +1,39 @@
+services:
+  miko:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miko
+    restart: unless-stopped
+    ports:
+      - "8400:8400"
+    environment:
+      - LLAMA_SERVER_URL=http://172.23.0.1:11435
+      - EMBED_SERVER_URL=http://172.23.0.1:11436
+      - PLEADLY_API_URL=http://172.23.0.1:8300
+      - QDRANT_URL=http://awaas-qdrant:6333
+      - QDRANT_API_KEY=2fe53fc367794a59490be07e5ec97ccacb0bff8a2ab696eaea1caad7d26aa632
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ERIC_CHAT_ID=7355900090
+      - DAVID_CHAT_ID=1697120532
+      - MIKO_MODEL=Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+    networks:
+      - awaas-shared
+      - awaas-monitor
+      - awaas-services
+    volumes:
+      - ./SOUL.md:/app/SOUL.md:ro
+      - ./static:/app/static:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8400/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  awaas-shared:
+    external: true
+  awaas-monitor:
+    external: true
+  awaas-services:
+    external: true
