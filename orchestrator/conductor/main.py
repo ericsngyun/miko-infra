@@ -94,21 +94,92 @@ async def health_poll_job() -> None:
         logger.warning("Health poll complete — %d down: %s", len(down), down)
 
 
+async def get_open_tasks(owner: str) -> list[dict]:
+    """Fetch open tasks for a principal from master-postgres."""
+    try:
+        import asyncpg as _asyncpg
+        conn = await _asyncpg.connect(host=settings.pg_host, port=settings.pg_port, user=settings.pg_user, password=settings.pg_password, database=settings.pg_database)
+        rows = await conn.fetch(
+            """SELECT id, title, priority, status, due_date
+               FROM tasks
+               WHERE (owner = $1 OR owner = 'both')
+               AND status != 'done'
+               ORDER BY priority, due_date NULLS LAST
+               LIMIT 10""",
+            owner
+        )
+        await conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("get_open_tasks failed: %s", e)
+        return []
+
+
 async def daily_brief_job() -> None:
+    """Send 9am morning brief to Eric and David with infra state + tasks."""
     results = await poll_all()
     down = down_services(results)
     up_count = len(results) - len(down)
+    today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
 
-    lines = [
-        f"*☀️ Daily brief — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}*\n",
-        f"Services: ✅ {up_count} up   🔴 {len(down)} down",
-    ]
+    infra_line = f"✅ {up_count}/{len(results)} services OK"
     if down:
-        lines.append("\nDown:")
-        for r in down:
-            lines.append(f"  • `{r.service}`")
+        names = ", ".join(f"`{r.service}`" for r in down)
+        infra_line = f"🔴 {len(down)} degraded: {names}"
 
-    await bot.alert("info", "\n".join(lines))
+    # Get spend
+    spend_line = ""
+    try:
+        import asyncpg as _asyncpg
+        conn = await _asyncpg.connect(host=settings.pg_host, port=settings.pg_port, user=settings.pg_user, password=settings.pg_password, database=settings.pg_database)
+        rows = await conn.fetch(
+            "SELECT key, value FROM conductor_state WHERE key IN ('total_spend_usd', 'budget_usd')"
+        )
+        await conn.close()
+        kv = {r["key"]: float(r["value"]) for r in rows}
+        spend = kv.get("total_spend_usd", 0.0)
+        budget = kv.get("budget_usd", 90.0)
+        pct = (spend / budget * 100) if budget else 0
+        spend_line = f"💰 Spend: ${spend:.2f} / ${budget:.0f} ({pct:.0f}%)"
+    except Exception as e:
+        logger.warning("Brief spend fetch failed: %s", e)
+        spend_line = "💰 Spend: unavailable"
+
+    principals = [
+        {"user": "eric",  "chat_id": 7355900090,  "name": "Eric"},
+        {"user": "david", "chat_id": 1697120532,  "name": "David"},
+    ]
+
+    for p in principals:
+        tasks = await get_open_tasks(p["user"])
+
+        if tasks:
+            task_lines = []
+            for t in tasks:
+                icon = "🔴" if t["priority"] == 1 else "🟡" if t["priority"] == 2 else "🔵"
+                due = f" — due {t['due_date']}" if t["due_date"] else ""
+                task_lines.append(f"{icon} [{t['id']}] {t['title']}{due}")
+            tasks_block = "\n".join(task_lines)
+        else:
+            tasks_block = "✅ No open tasks"
+
+        brief = (
+            f"*☀️ Good morning, {p['name']}* — {today}\n\n"
+            f"*Infrastructure*\n{infra_line}\n{spend_line}\n\n"
+            f"*Open Tasks*\n{tasks_block}\n\n"
+            f"_Talk to Miko to add tasks, mark done, or get today's strategy focus._"
+        )
+
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=10.0) as _client:
+                await _client.post(
+                    f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                    json={"chat_id": p["chat_id"], "text": brief, "parse_mode": "Markdown"}
+                )
+            logger.info("Morning brief sent to %s", p["name"])
+        except Exception as _e:
+            logger.warning("Brief send failed for %s: %s", p["name"], _e)
 
 
 async def spend_poll_job() -> None:
@@ -152,7 +223,7 @@ async def main() -> None:
     scheduler.add_job(
         daily_brief_job,
         "cron",
-        hour=8,
+        hour=9,
         minute=0,
         id="daily_brief",
     )
