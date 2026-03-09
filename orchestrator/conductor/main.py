@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from db import close_pool, log_health
-from health import down_services, poll_all
+from db import close_pool, log_health, upsert_infrastructure_state
+from health import down_services, poll_all, HTTP_SERVICES_EXTENDED
 from spend_governor import check_all_spend
 from settings import settings
 from telegram_bot import ConductorBot
@@ -35,9 +35,40 @@ async def health_poll_job() -> None:
     results = await poll_all()
     down = {r.service for r in down_services(results)}
 
-    # Persist all results to health_log
+    # Persist all results to health_log and infrastructure_state
     for r in results:
         await log_health(r.service, r.project, r.status)
+        await upsert_infrastructure_state(
+            service=r.service,
+            project_name=r.project if r.project not in ("monitor", "shared") else None,
+            status=r.status,
+            response_ms=int(r.latency_ms),
+            detail={"status_code": r.status_code, "latency_ms": round(r.latency_ms, 1)},
+        )
+
+    # Also poll extended services (llama-server, miko)
+    import httpx as _httpx
+    from datetime import datetime as _dt, timezone as _tz
+    async with _httpx.AsyncClient(timeout=5.0) as _client:
+        for _svc in HTTP_SERVICES_EXTENDED:
+            _t0 = _dt.now(_tz.utc)
+            try:
+                _resp = await _client.get(_svc["url"])
+                _latency = (_dt.now(_tz.utc) - _t0).total_seconds() * 1000
+                _status = "up" if _resp.status_code < 500 else "down"
+                _code = _resp.status_code
+            except Exception as _exc:
+                _latency = (_dt.now(_tz.utc) - _t0).total_seconds() * 1000
+                _status = "down"
+                _code = None
+                logger.warning("Extended health check failed for %s: %s", _svc["name"], _exc)
+            await upsert_infrastructure_state(
+                service=_svc["name"],
+                project_name=_svc["project"] if _svc["project"] not in ("monitor", "shared") else None,
+                status=_status,
+                response_ms=int(_latency),
+                detail={"status_code": _code, "latency_ms": round(_latency, 1)},
+            )
 
     for svc in down - _previously_down:
         logger.error("SERVICE DOWN: %s", svc)

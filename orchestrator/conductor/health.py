@@ -101,3 +101,10 @@ async def poll_all() -> list[HealthResult]:
 
 def down_services(results: list[HealthResult]) -> list[HealthResult]:
     return [r for r in results if r.status == "down"]
+
+
+# Extended services added POST-A — llama-server and miko
+HTTP_SERVICES_EXTENDED: list[dict] = [
+    {"project": "pleadly", "name": "llama-server", "url": "http://172.23.0.1:11435/health"},
+    {"project": "awaas",   "name": "miko",         "url": "http://miko:8400/health"},
+]

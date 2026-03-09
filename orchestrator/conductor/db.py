@@ -151,3 +151,45 @@ async def get_chat_ids_with_roles() -> list[dict]:
     except Exception as exc:
         logger.error("Failed to load principals: %s", exc)
         return []
+
+
+async def upsert_infrastructure_state(
+    service: str,
+    project_name: str | None,
+    status: str,
+    response_ms: float | None = None,
+    detail: dict | None = None,
+) -> None:
+    """Upsert current service state into infrastructure_state. Miko reads this."""
+    import json
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Resolve project_id from name if provided
+            project_id = None
+            if project_name:
+                row = await conn.fetchrow(
+                    "SELECT id FROM projects WHERE name = $1", project_name
+                )
+                if row:
+                    project_id = row["id"]
+
+            pg_status = "ok" if status == "up" else "down"
+            detail_json = json.dumps(detail) if detail else None
+
+            await conn.execute("""
+                INSERT INTO infrastructure_state
+                    (service, project_id, status, last_checked, last_ok, detail)
+                VALUES ($1, $2, $3, NOW(),
+                    CASE WHEN $3 = 'ok' THEN NOW() ELSE NULL END,
+                    $4::jsonb)
+                ON CONFLICT (service) DO UPDATE SET
+                    project_id   = EXCLUDED.project_id,
+                    status       = EXCLUDED.status,
+                    last_checked = NOW(),
+                    last_ok      = CASE WHEN EXCLUDED.status = 'ok' THEN NOW()
+                                        ELSE infrastructure_state.last_ok END,
+                    detail       = EXCLUDED.detail
+            """, service, project_id, pg_status, detail_json)
+    except Exception as exc:
+        logger.error("Failed to upsert infrastructure_state for %s: %s", service, exc)
