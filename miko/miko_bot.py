@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import json
+import subprocess
+import re
+import shlex
+import uuid
+from collections import deque
 try:
     import asyncpg as _asyncpg
     ASYNCPG_AVAILABLE = True
@@ -36,6 +42,7 @@ from pydantic import BaseModel
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -60,6 +67,422 @@ FAST_MODEL       = os.getenv("MIKO_FAST_MODEL",    "Qwen3.5-4B-Q4_K_M.gguf")
 FAST_SERVER_URL  = os.getenv("FAST_SERVER_URL",    "http://172.23.0.1:11437")
 
 SOUL_MD_PATH = Path(__file__).parent / "SOUL.md"
+
+# ---------------------------------------------------------------------------
+# Session history — rolling 20-message buffer per principal
+# ---------------------------------------------------------------------------
+_session_history: dict[str, deque] = {}
+
+# ---------------------------------------------------------------------------
+# Postgres DSN — pulled from env set in docker-compose
+# ---------------------------------------------------------------------------
+MASTER_POSTGRES_DSN = os.getenv(
+    "MASTER_POSTGRES_DSN",
+    "postgresql://awaas_master:@master-postgres:5432/awaas_master"
+)
+
+# ---------------------------------------------------------------------------
+# Permission system
+# ---------------------------------------------------------------------------
+# Tier: "green" = auto, "yellow" = ask + 2min auto-approve, "red" = always ask
+TOOL_PERMISSION_TIER: dict[str, str] = {
+    "task_list":   "green",
+    "infra_query": "green",
+    "remember":    "green",
+    "task_add":    "yellow",
+    "task_update": "yellow",
+    "shell_exec":  "yellow",   # individual calls may be escalated to red inside the executor
+}
+
+# Pending approvals: uuid → {tool_name, tool_args, user_id, event, result, approved}
+_pending_approvals: dict[str, dict] = {}
+
+# request_permission removed — replaced by non-blocking execute_tool
+
+
+async def handle_approval_callback(update, context) -> None:
+    """Handle ✅/❌ button presses — execute tool immediately on approval."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if ":" not in data:
+        return
+
+    action, approval_id = data.split(":", 1)
+    if approval_id not in _pending_approvals:
+        await query.edit_message_text("⚠️ This request has already been handled or expired.")
+        return
+
+    entry = _pending_approvals.pop(approval_id)
+    tool_name = entry["tool_name"]
+    tool_args = entry["tool_args"]
+    user_id = entry["user_id"]
+    chat_id = entry.get("chat_id", ERIC_CHAT_ID)
+
+    if action == "deny":
+        await query.edit_message_text(f"❌ Denied: `{tool_name}`", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⛔ Action `{tool_name}` was denied.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return
+
+    # Approved — execute the tool
+    await query.edit_message_text(f"✅ Approved: `{tool_name}` — executing...", parse_mode="Markdown")
+    try:
+        result = await _dispatch_tool(tool_name, tool_args, user_id)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ `{tool_name}` complete:\n{result}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ `{tool_name}` failed after approval: {e}",
+            parse_mode="Markdown",
+        )
+
+def get_session_history(user_id: str) -> deque:
+    if user_id not in _session_history:
+        _session_history[user_id] = deque(maxlen=20)
+    return _session_history[user_id]
+
+def append_to_history(user_id: str, role: str, content: str) -> None:
+    get_session_history(user_id).append({"role": role, "content": content})
+
+# ---------------------------------------------------------------------------
+# Tool definitions — OpenAI tools format for llama-server
+# ---------------------------------------------------------------------------
+MIKO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "task_add",
+            "description": "Add a new task to the Koven Labs task board in master-postgres.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":    {"type": "string", "description": "Short task title"},
+                    "owner":    {"type": "string", "enum": ["eric", "david", "both"], "description": "Who owns this task"},
+                    "priority": {"type": "integer", "enum": [1, 2, 3], "description": "1=critical, 2=normal, 3=low"},
+                    "due_date": {"type": "string", "description": "ISO date string YYYY-MM-DD, optional"},
+                },
+                "required": ["title", "owner", "priority"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "Update the status of an existing task by ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id":     {"type": "integer", "description": "Task ID from the tasks table"},
+                    "status": {"type": "string", "enum": ["open", "in_progress", "done", "blocked"]},
+                },
+                "required": ["id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "List open tasks for a principal. Returns up to 15 open tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "enum": ["eric", "david", "both", "all"], "description": "Filter by owner. Use 'all' to see everything."},
+                },
+                "required": ["owner"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Permanently store a fact about the user or business into long-term memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "The fact to remember, stated clearly and concisely."},
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "infra_query",
+            "description": "Query live infrastructure state from master-postgres. Returns service health, uptime, and details.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {"type": "string", "description": "Service name to filter, or 'all' for full state."},
+                },
+                "required": ["service"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell_exec",
+            "description": "Execute a read-only shell command on the node. Allowed: docker ps, docker logs, df, free, cat of log files, systemctl status. No writes, no rm, no curl to external URLs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Tool executor — maps tool name → async Python function
+# ---------------------------------------------------------------------------
+
+async def _tool_task_add(title: str, owner: str, priority: int, due_date: str | None = None) -> str:
+    if not ASYNCPG_AVAILABLE:
+        return "Error: asyncpg not available"
+    try:
+        conn = await _asyncpg.connect(dsn=MASTER_POSTGRES_DSN)
+        row = await conn.fetchrow(
+            """INSERT INTO tasks (owner, title, priority, status, due_date)
+               VALUES ($1, $2, $3, 'open', $4) RETURNING id""",
+            owner, title, priority, due_date
+        )
+        await conn.close()
+        return f"✅ Task #{row['id']} created: '{title}' [{owner}] priority {priority}"
+    except Exception as e:
+        return f"Error creating task: {e}"
+
+
+async def _tool_task_update(id: int, status: str) -> str:
+    if not ASYNCPG_AVAILABLE:
+        return "Error: asyncpg not available"
+    try:
+        conn = await _asyncpg.connect(dsn=MASTER_POSTGRES_DSN)
+        row = await conn.fetchrow(
+            "UPDATE tasks SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING id, title",
+            status, id
+        )
+        await conn.close()
+        if row:
+            return f"✅ Task #{row['id']} '{row['title']}' → {status}"
+        return f"No task found with id={id}"
+    except Exception as e:
+        return f"Error updating task: {e}"
+
+
+async def _tool_task_list(owner: str) -> str:
+    if not ASYNCPG_AVAILABLE:
+        return "Error: asyncpg not available"
+    try:
+        conn = await _asyncpg.connect(dsn=MASTER_POSTGRES_DSN)
+        if owner == "all":
+            rows = await conn.fetch(
+                "SELECT id, owner, title, priority, status, due_date FROM tasks WHERE status != 'done' ORDER BY priority, owner LIMIT 15"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, owner, title, priority, status, due_date FROM tasks WHERE (owner=$1 OR owner='both') AND status != 'done' ORDER BY priority LIMIT 15",
+                owner
+            )
+        await conn.close()
+        if not rows:
+            return "No open tasks found."
+        lines = []
+        for r in rows:
+            icon = "🔴" if r["priority"] == 1 else "🟡" if r["priority"] == 2 else "🔵"
+            due = f" | due {r['due_date']}" if r["due_date"] else ""
+            lines.append(f"{icon} #{r['id']} [{r['owner']}] {r['title']} ({r['status']}){due}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing tasks: {e}"
+
+
+async def _tool_remember(user_id: str, fact: str) -> str:
+    success = await remember_fact(user_id=user_id, fact=fact)
+    return f"✅ Remembered: {fact}" if success else "⚠️ Failed to write to memory"
+
+
+async def _tool_infra_query(service: str) -> str:
+    try:
+        conn = await _asyncpg.connect(dsn=MASTER_POSTGRES_DSN)
+        if service == "all":
+            rows = await conn.fetch(
+                "SELECT service, status, detail, checked_at FROM infrastructure_state ORDER BY service"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT service, status, detail, checked_at FROM infrastructure_state WHERE service ILIKE $1",
+                f"%{service}%"
+            )
+        await conn.close()
+        if not rows:
+            return f"No infrastructure data found for '{service}'"
+        lines = []
+        for r in rows:
+            icon = "✅" if r["status"] == "ok" else "🔴"
+            detail = f" — {r['detail']}" if r["detail"] else ""
+            lines.append(f"{icon} {r['service']}{detail}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error querying infra: {e}"
+
+
+SHELL_ALLOWED_PREFIXES = [
+    "docker ps", "docker logs", "docker stats",
+    "df ", "df\n", "free ", "free\n",
+    "systemctl status",
+    "cat /var/log", "cat /home/miko_node_001",
+    "ls ", "pwd", "uptime", "uname",
+    "curl http://172.", "curl http://localhost",
+]
+
+def _shell_allowed(command: str) -> bool:
+    cmd = command.strip().lower()
+    # Block dangerous ops
+    for blocked in ["rm ", "sudo ", "chmod ", "chown ", "curl http", "wget ", "> /", "dd ", "mkfs"]:
+        if blocked in cmd:
+            return False
+    for prefix in SHELL_ALLOWED_PREFIXES:
+        if cmd.startswith(prefix.lower()):
+            return True
+    return False
+
+
+async def _tool_shell_exec(command: str) -> str:
+    if not _shell_allowed(command):
+        return f"⛔ Command not permitted: `{command}`. Allowed: docker ps/logs, df, free, systemctl status, cat logs."
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            capture_output=True, text=True, timeout=10
+        )
+        out = result.stdout.strip() or result.stderr.strip()
+        return out[:2000] if out else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "⚠️ Command timed out (10s limit)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
+    """Execute a tool directly, no permission check."""
+    if tool_name == "task_add":
+        return await _tool_task_add(**tool_args)
+    elif tool_name == "task_update":
+        return await _tool_task_update(**tool_args)
+    elif tool_name == "task_list":
+        return await _tool_task_list(**tool_args)
+    elif tool_name == "remember":
+        return await _tool_remember(user_id=user_id, fact=tool_args.get("fact", ""))
+    elif tool_name == "infra_query":
+        return await _tool_infra_query(**tool_args)
+    elif tool_name == "shell_exec":
+        return await _tool_shell_exec(**tool_args)
+    else:
+        return f"Unknown tool: {tool_name}"
+
+
+async def execute_tool(tool_name: str, tool_args: dict, user_id: str, bot=None) -> str:
+    """
+    Dispatch tool call with permission gating.
+    Green: execute immediately.
+    Yellow/Red: send approval request to Eric, store pending action,
+                return a holding message immediately — callback handler
+                executes the tool and sends the result when approved.
+    """
+    _log = logging.getLogger("miko.tools")
+    _log.info("Executing tool: %s args=%s", tool_name, tool_args)
+
+    tier = TOOL_PERMISSION_TIER.get(tool_name, "yellow")
+    if tool_name == "shell_exec":
+        cmd = tool_args.get("command", "").lower()
+        if any(p in cmd for p in ["restart", "stop", "start", "kill", "rm ", "write", "chmod"]):
+            tier = "red"
+
+    # Green tier — execute immediately, no approval needed
+    if tier == "green" or bot is None:
+        try:
+            return await _dispatch_tool(tool_name, tool_args, user_id)
+        except Exception as e:
+            _log.error("Tool %s failed: %s", tool_name, e)
+            return f"Tool error: {e}"
+
+    # Yellow/Red — send approval request, store pending, return immediately
+    approval_id = str(uuid.uuid4())[:8]
+    _pending_approvals[approval_id] = {
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "user_id": user_id,
+        "chat_id": ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID,
+        "approved": None,
+    }
+
+    args_display = ", ".join(f"{k}={repr(v)}" for k, v in tool_args.items())
+    timeout_note = "\n_Auto-approves in 2 min._" if tier == "yellow" else ""
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve:{approval_id}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"deny:{approval_id}"),
+    ]])
+
+    try:
+        await bot.send_message(
+            chat_id=ERIC_CHAT_ID,
+            text=(
+                f"🔐 *Permission Request* `[{approval_id}]`\n\n"
+                f"Tool: `{tool_name}`\n"
+                f"Args: `{args_display}`\n"
+                f"From: {user_id}{timeout_note}"
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        _log.warning("Permission request send failed: %s", e)
+        # Fail open for yellow
+        if tier == "yellow":
+            del _pending_approvals[approval_id]
+            return await _dispatch_tool(tool_name, tool_args, user_id)
+        return f"⛔ Could not send permission request for `{tool_name}`"
+
+    # Schedule auto-approve for yellow after 120s
+    if tier == "yellow":
+        async def _auto_approve():
+            await asyncio.sleep(120)
+            if approval_id in _pending_approvals:
+                entry = _pending_approvals.pop(approval_id)
+                _log.info("Auto-approving %s after timeout", tool_name)
+                result = await _dispatch_tool(entry["tool_name"], entry["tool_args"], entry["user_id"])
+                try:
+                    await bot.send_message(
+                        chat_id=entry["chat_id"],
+                        text=f"⏱ Auto-approved `{tool_name}`:\n{result}",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+        asyncio.create_task(_auto_approve())
+
+    return f"⏳ Waiting for approval `[{approval_id}]` — you'll get a confirmation once approved."
+
 MASTER_POSTGRES_DSN = os.getenv("MASTER_POSTGRES_DSN", "")
 
 logging.basicConfig(
@@ -78,6 +501,13 @@ def load_soul() -> str:
     return "You are Miko, a sharp personal assistant for Eric at Miko Labs."
 
 SOUL = load_soul()
+
+# Telegram bot instance — set during startup so tools can send permission requests
+_tg_bot = None
+
+def set_tg_bot(bot) -> None:
+    global _tg_bot
+    _tg_bot = bot
 
 # ---------------------------------------------------------------------------
 # Model router — zero latency keyword classifier
@@ -350,82 +780,163 @@ async def chat_with_miko(
     include_pleadly_status: bool = False,
 ) -> str:
     """
-    Core reasoning call. Assembles context from:
-    1. SOUL.md system prompt
-    2. Relevant Mem0 memories
-    3. Optional live Pleadly status
-    4. User message
+    Core reasoning call — Layer 1 agent loop.
+
+    Architecture:
+    1. Build system prompt: SOUL + principal context + datetime + memories + infra
+    2. Inject session history for conversational continuity
+    3. Call 35B with tools array (Hermes-style tool calling)
+    4. If model requests a tool call: execute it, inject result, re-call for final response
+    5. Save exchange to session history + Mem0
+    6. Max 5 tool call iterations per message to prevent runaway loops
     """
-    # Build system prompt
+    # ── Build system prompt ────────────────────────────────────────────────
     system_parts = [SOUL]
 
-    # Inject principal-specific context
     principal_ctx = get_principal_context(user_id)
     if principal_ctx:
         system_parts.append(principal_ctx)
 
-    # Inject current date/time
     now = datetime.now(timezone.utc).strftime("%A, %B %d, %Y at %H:%M UTC")
     system_parts.append(f"\n\n---\nCurrent date/time: {now}")
 
-    # Inject relevant memories
     memories = await get_memories(user_id=user_id, query=user_message)
-    memory_block = ""
     if memories:
         mem_lines = "\n".join(f"- {m}" for m in memories[:5])
-        memory_block = f"\n\n---\nWhat you remember about {user_id}:\n{mem_lines}"
-        system_parts.append(memory_block)
+        system_parts.append(f"\n\n---\nWhat you remember about {user_id}:\n{mem_lines}")
 
-    # Inject Pleadly status if requested or if message seems infra-related
     infra_keywords = ["pleadly", "status", "health", "pipeline", "api", "server", "running", "down",
                        "node", "infrastructure", "services", "containers", "docker", "llama", "miko",
-                       "memory", "gpu", "ram", "queue", "up", "operational", "state"]
+                       "memory", "gpu", "ram", "queue", "up", "operational", "state", "task", "tasks"]
     if include_pleadly_status or any(k in user_message.lower() for k in infra_keywords):
         pleadly_status = await get_pleadly_status()
         status_str = format_pleadly_status(pleadly_status)
         infra_state = await get_infrastructure_state()
         system_parts.append(f"\n\n---\nLive system status (just fetched):\n{status_str}\n\n{infra_state}")
 
+    system_parts.append("""
+
+---
+TOOL USE INSTRUCTIONS:
+You have access to tools. Use them when the user asks you to take action — add tasks, check infra, remember facts, run shell commands.
+When you call a tool, you MUST use this exact format with no text after the tool call:
+<tool_call>
+{"name": "tool_name", "arguments": {"arg1": "value1"}}
+</tool_call>
+After the tool result is returned, synthesize a natural response. Never fabricate tool results.""")
+
     system_prompt = "".join(system_parts)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    # ── Build message list with session history ────────────────────────────
+    history = list(get_session_history(user_id))
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history[-14:])  # last 14 turns = ~7 exchanges
+    messages.append({"role": "user", "content": user_message})
 
-    selected_model, selected_server = route_model(user_message)
-    logger.info("Model routing: %s -> :%s", selected_model[:25], selected_server.split(":")[-1])
+    # Always use deep model for tool-capable calls
+    selected_model = MODEL
+    selected_server = LLAMA_SERVER_URL
+    logger.info("Agent call: model=%s", selected_model[:30])
+
+    # ── Agent loop — max 5 tool call iterations ────────────────────────────
+    final_reply = ""
+    tool_iterations = 0
+    MAX_TOOL_ITERATIONS = 5
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{selected_server}/v1/chat/completions",
-                json={
-                    "model": selected_model,
-                    "messages": messages,
-                    "stream": False,
-                    "temperature": 0.7,
-                    "max_tokens": 1024,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            reply = data["choices"][0]["message"]["content"].strip()
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            while tool_iterations <= MAX_TOOL_ITERATIONS:
+                response = await client.post(
+                    f"{selected_server}/v1/chat/completions",
+                    json={
+                        "model": selected_model,
+                        "messages": messages,
+                        "tools": MIKO_TOOLS,
+                        "tool_choice": "auto",
+                        "stream": False,
+                        "temperature": 0.7,
+                        "max_tokens": 1024,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                choice = data["choices"][0]
+                msg = choice["message"]
+                content = msg.get("content") or ""
+                tool_calls = msg.get("tool_calls") or []
 
-        # Save to memory (fire and forget)
-        asyncio.create_task(save_memory(
-            user_id=user_id,
-            messages=[
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": reply},
-            ],
-        ))
+                # ── Path A: native tool_calls in response ──────────────────
+                if tool_calls:
+                    tool_call = tool_calls[0]  # handle first tool call
+                    tool_name = tool_call["function"]["name"]
+                    try:
+                        tool_args = json.loads(tool_call["function"]["arguments"])
+                    except Exception:
+                        tool_args = {}
 
-        return reply
+                    logger.info("Tool call (native): %s %s", tool_name, tool_args)
+                    tool_result = await execute_tool(tool_name, tool_args, user_id, bot=_tg_bot)
+
+                    # If tool is pending approval, return holding message immediately
+                    if tool_result.startswith("⏳ Waiting for approval"):
+                        final_reply = tool_result
+                        break
+
+                    # Append assistant tool call + tool result to messages
+                    messages.append(msg)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", "call_0"),
+                        "content": tool_result,
+                    })
+                    tool_iterations += 1
+                    continue
+
+                # ── Path B: XML <tool_call> in content (Hermes fallback) ───
+                xml_match = re.search(r"<tool_call>\s*({.*?})\s*</tool_call>", content, re.DOTALL)
+                if xml_match:
+                    try:
+                        call_data = json.loads(xml_match.group(1))
+                        tool_name = call_data.get("name", "")
+                        tool_args = call_data.get("arguments", {})
+                        logger.info("Tool call (XML): %s %s", tool_name, tool_args)
+                        tool_result = await execute_tool(tool_name, tool_args, user_id, bot=_tg_bot)
+
+                        if tool_result.startswith("⏳ Waiting for approval"):
+                            final_reply = tool_result
+                            break
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({"role": "user", "content": f"Tool result: {tool_result}"})
+                        tool_iterations += 1
+                        continue
+                    except Exception as e:
+                        logger.warning("XML tool parse failed: %s", e)
+
+                # ── Path C: no tool call — final response ──────────────────
+                final_reply = content.strip()
+                break
+
+            else:
+                # Hit iteration cap — return last content
+                final_reply = content.strip() if content else "I hit my action limit on that request. Ask me to continue."
 
     except Exception as e:
         logger.error("LLM call failed: %s", e)
         return "Something broke on my end. Check the logs — I'll be back in a second."
+
+    # ── Save to session history + Mem0 ────────────────────────────────────
+    append_to_history(user_id, "user", user_message)
+    append_to_history(user_id, "assistant", final_reply)
+
+    asyncio.create_task(save_memory(
+        user_id=user_id,
+        messages=[
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": final_reply},
+        ],
+    ))
+
+    return final_reply
 
 # ---------------------------------------------------------------------------
 # Telegram bot
@@ -555,7 +1066,9 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    set_tg_bot(app.bot)
     return app
 
 # ---------------------------------------------------------------------------
