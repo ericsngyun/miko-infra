@@ -19,6 +19,11 @@ services:
       - MIKO_MODEL=Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
       - MIKO_FAST_MODEL=Qwen3.5-4B-Q4_K_M.gguf
       - FAST_SERVER_URL=http://172.23.0.1:11437
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - N8N_URL=${N8N_URL}
+      - CLAUDE_FAST_MODEL=claude-haiku-4-5-20251001
+      - CLAUDE_DEFAULT_MODEL=claude-sonnet-4-6
+      - CLAUDE_DEEP_MODEL=claude-opus-4-6
       - MASTER_POSTGRES_DSN=postgresql://awaas_master:c784b47fc96ec5fe8981a3fab61fec8e34936990755f3ad1c60438bc1bf8a2d2@master-postgres:5432/awaas_master
     networks:
       - awaas-shared

@@ -65,6 +65,8 @@ DAVID_CHAT_ID    = int(os.getenv("DAVID_CHAT_ID",  "1697120532"))
 MODEL            = os.getenv("MIKO_MODEL",         "qwen3.5")
 FAST_MODEL       = os.getenv("MIKO_FAST_MODEL",    "Qwen3.5-4B-Q4_K_M.gguf")
 FAST_SERVER_URL  = os.getenv("FAST_SERVER_URL",    "http://172.23.0.1:11437")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+N8N_URL          = os.getenv("N8N_URL",            "http://awaas-n8n:5679")
 
 SOUL_MD_PATH = Path(__file__).parent / "SOUL.md"
 
@@ -89,9 +91,13 @@ TOOL_PERMISSION_TIER: dict[str, str] = {
     "task_list":   "green",
     "infra_query": "green",
     "remember":    "green",
+    "web_fetch":   "green",
+    "web_search":  "green",
+    "claude_query":"green",
+    "research":    "green",
     "task_add":    "yellow",
     "task_update": "yellow",
-    "shell_exec":  "yellow",   # individual calls may be escalated to red inside the executor
+    "shell_exec":  "yellow",
 }
 
 # Pending approvals: uuid → {tool_name, tool_args, user_id, event, result, approved}
@@ -248,6 +254,67 @@ MIKO_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch and extract clean text content from any URL. Use for reading articles, docs, competitor pages, news, GitHub repos, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url":      {"type": "string", "description": "Full URL to fetch"},
+                    "summary":  {"type": "boolean", "description": "If true, return a brief summary instead of full text. Default false."},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information. Returns top results with titles, URLs, and snippets. Use before web_fetch to find the right URLs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Number of results to return. Default 5, max 10."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "claude_query",
+            "description": "Consult Claude (claude-sonnet-4-20250514) for tasks requiring deep analysis, very long documents, complex reasoning across many sources, or when you need a second opinion on high-stakes decisions. Use sparingly — it costs money.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt":   {"type": "string", "description": "The full prompt to send to Claude"},
+                    "context":  {"type": "string", "description": "Additional context or document text to include"},
+                    "max_tokens": {"type": "integer", "description": "Max tokens for response. Default 2000."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research",
+            "description": "Run an autonomous multi-step research task in the background. Miko will search, fetch, synthesize, and return a full intelligence brief. Use for competitive research, market analysis, technical deep-dives. Runs async — you get pinged when done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal":    {"type": "string", "description": "What to research — be specific about what you want to know"},
+                    "depth":   {"type": "string", "enum": ["quick", "standard", "deep"], "description": "quick=3 sources, standard=8 sources, deep=15+ sources"},
+                },
+                "required": ["goal"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -381,7 +448,224 @@ async def _tool_shell_exec(command: str) -> str:
         return f"Error: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Web + AI tool implementations
+# ---------------------------------------------------------------------------
+
+async def _tool_web_fetch(url: str, summary: bool = False) -> str:
+    """Fetch and extract clean text from a URL using trafilatura."""
+    try:
+        import trafilatura
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MikoBot/1.0)"}) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            html = resp.text
+
+        text = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,
+            favor_recall=True,
+        )
+
+        if not text:
+            # Fallback: BeautifulSoup plain text
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "lxml")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)[:8000]
+
+        if not text:
+            return f"Could not extract text from {url}"
+
+        text = text[:12000]  # cap at ~3K tokens
+
+        if summary and len(text) > 1000:
+            # Use local 35B to summarize
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                    json={
+                        "model": MODEL,
+                        "messages": [
+                            {"role": "system", "content": "Summarize the following web page content in 3-5 bullet points. Be concise and factual."},
+                            {"role": "user", "content": text},
+                        ],
+                        "max_tokens": 400,
+                        "temperature": 0.3,
+                    }
+                )
+                return r.json()["choices"][0]["message"]["content"].strip()
+
+        return f"[{url}]\n\n{text}"
+
+    except Exception as e:
+        return f"web_fetch error: {e}"
+
+
+async def _tool_web_search(query: str, max_results: int = 5) -> str:
+    """Search the web via DuckDuckGo HTML (no API key required)."""
+    try:
+        max_results = min(max_results, 10)
+        search_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MikoBot/1.0)"}) as client:
+            resp = await client.get(search_url)
+            resp.raise_for_status()
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "lxml")
+        results = []
+        for r in soup.select(".result")[:max_results]:
+            title_el = r.select_one(".result__title")
+            snippet_el = r.select_one(".result__snippet")
+            url_el = r.select_one(".result__url")
+            title = title_el.get_text(strip=True) if title_el else "No title"
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            url = url_el.get_text(strip=True) if url_el else ""
+            results.append(f"**{title}**\n{url}\n{snippet}")
+
+        if not results:
+            return f"No results found for: {query}"
+
+        return f"Search results for '{query}':\n\n" + "\n\n---\n\n".join(results)
+
+    except Exception as e:
+        return f"web_search error: {e}"
+
+
+async def _tool_claude_query(prompt: str, context: str = "", max_tokens: int = 2000) -> str:
+    """Query Claude claude-sonnet-4-20250514 via Anthropic API."""
+    if not ANTHROPIC_API_KEY:
+        return "Error: ANTHROPIC_API_KEY not configured"
+    try:
+        full_prompt = f"{context}\n\n{prompt}".strip() if context else prompt
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": full_prompt}],
+                }
+            )
+            resp.raise_for_status()
+            return resp.json()["content"][0]["text"]
+    except Exception as e:
+        return f"claude_query error: {e}"
+
+
+# Active research tasks: task_id → status
+_research_tasks: dict[str, str] = {}
+
+async def _tool_research(goal: str, depth: str = "standard", user_id: str = "eric") -> str:
+    """
+    Spin up an async research loop. Returns immediately with a task ID.
+    The loop runs in background: search → fetch → synthesize → notify.
+    """
+    task_id = str(uuid.uuid4())[:8]
+    _research_tasks[task_id] = "running"
+
+    source_counts = {"quick": 3, "standard": 6, "deep": 12}
+    n_sources = source_counts.get(depth, 6)
+
+    async def _run_research():
+        try:
+            logger = logging.getLogger("miko.research")
+            logger.info("Research task %s started: %s", task_id, goal)
+
+            # Step 1: Search
+            search_results = await _tool_web_search(goal, max_results=n_sources)
+
+            # Step 2: Extract URLs from search results
+            urls = []
+            for line in search_results.split("\n"):
+                line = line.strip()
+                if line.startswith("http") and len(line) < 200:
+                    urls.append(line)
+
+            # Step 3: Fetch and extract content from top URLs
+            fetched = []
+            for url in urls[:n_sources]:
+                text = await _tool_web_fetch(url, summary=True)
+                if "error" not in text.lower():
+                    fetched.append(f"Source: {url}\n{text}")
+                await asyncio.sleep(0.5)  # polite crawl delay
+
+            # Step 4: Synthesize with 35B
+            if fetched:
+                combined = "\n\n---\n\n".join(fetched[:n_sources])
+                synthesis_prompt = f"""You are Miko, a strategic intelligence assistant for Koven Labs.
+
+Research goal: {goal}
+
+Sources gathered:
+{combined[:16000]}
+
+Produce a sharp intelligence brief with:
+1. Key findings (3-5 bullets)
+2. Strategic implications for Koven Labs / Pleadly
+3. Action items if any
+4. Sources used
+
+Be direct, factual, and cut anything that isn't immediately useful."""
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    r = await client.post(
+                        f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                        json={
+                            "model": MODEL,
+                            "messages": [
+                                {"role": "system", "content": "You are a sharp strategic intelligence analyst."},
+                                {"role": "user", "content": synthesis_prompt},
+                            ],
+                            "max_tokens": 1500,
+                            "temperature": 0.4,
+                        }
+                    )
+                    brief = r.json()["choices"][0]["message"]["content"].strip()
+            else:
+                brief = f"Could not fetch sources for: {goal}\n\nSearch results:\n{search_results}"
+
+            _research_tasks[task_id] = "done"
+            logger.info("Research task %s complete", task_id)
+
+            # Notify via Telegram
+            chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
+            if _tg_bot:
+                # Split if too long
+                header = f"🔬 *Research Complete* `[{task_id}]`\n*Goal:* {goal}\n\n"
+                full_msg = header + brief
+                if len(full_msg) <= 4096:
+                    await _tg_bot.send_message(chat_id=chat_id, text=full_msg, parse_mode="Markdown")
+                else:
+                    await _tg_bot.send_message(chat_id=chat_id, text=header + brief[:3800] + "\n\n_[truncated]_", parse_mode="Markdown")
+
+        except Exception as e:
+            _research_tasks[task_id] = f"error: {e}"
+            logging.getLogger("miko.research").error("Research task %s failed: %s", task_id, e)
+            if _tg_bot:
+                chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
+                await _tg_bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Research task `{task_id}` failed: {e}",
+                    parse_mode="Markdown",
+                )
+
+    asyncio.create_task(_run_research())
+    return f"🔬 Research task `{task_id}` started ({depth}, ~{n_sources} sources).\nGoal: {goal}\n\nI\'ll ping you when the brief is ready."
+
+
 async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
+    """Execute a tool directly, no permission check."""
     """Execute a tool directly, no permission check."""
     if tool_name == "task_add":
         return await _tool_task_add(**tool_args)
@@ -395,6 +679,14 @@ async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
         return await _tool_infra_query(**tool_args)
     elif tool_name == "shell_exec":
         return await _tool_shell_exec(**tool_args)
+    elif tool_name == "web_fetch":
+        return await _tool_web_fetch(**tool_args)
+    elif tool_name == "web_search":
+        return await _tool_web_search(**tool_args)
+    elif tool_name == "claude_query":
+        return await _tool_claude_query(**tool_args)
+    elif tool_name == "research":
+        return await _tool_research(user_id=user_id, **tool_args)
     else:
         return f"Unknown tool: {tool_name}"
 
