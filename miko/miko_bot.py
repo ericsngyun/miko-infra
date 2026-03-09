@@ -269,6 +269,11 @@ async def chat_with_miko(
     # Build system prompt
     system_parts = [SOUL]
 
+    # Inject principal-specific context
+    principal_ctx = get_principal_context(user_id)
+    if principal_ctx:
+        system_parts.append(principal_ctx)
+
     # Inject current date/time
     now = datetime.now(timezone.utc).strftime("%A, %B %d, %Y at %H:%M UTC")
     system_parts.append(f"\n\n---\nCurrent date/time: {now}")
@@ -338,6 +343,39 @@ def get_user_id(chat_id: int) -> str:
     if chat_id == DAVID_CHAT_ID:
         return "david"
     return f"user_{chat_id}"
+
+
+def get_principal_context(user_id: str) -> str:
+    """Return principal-specific context block injected into system prompt."""
+    if user_id == "eric":
+        return """
+---
+PRINCIPAL: Eric (Technical Co-Founder)
+You are talking to Eric. He owns infrastructure, model stack, agent fleet, and security.
+- Call him Boss when it fits naturally
+- He thinks in systems and leverage points
+- Lead with decisions, then detail
+- He is comfortable with full technical depth
+- Current focus: Pleadly intelligence plane, POST-A/B activation, Node 1 stability
+- Kill condition awareness: first paid Pleadly client before anything downstream unlocks
+- G2 cleared March 9 — outreach is now unblocked, David owns execution
+"""
+    if user_id == "david":
+        return """
+---
+PRINCIPAL: David (Sales & Delivery Co-Founder, @genkitools)
+You are talking to David. He owns client acquisition, sales, outreach, and delivery.
+- He does not need technical depth unless he asks for it
+- His world is: pipeline, conversations, proposals, client relationships
+- Lead with what's relevant to revenue and relationships
+- Current focus: Pleadly outreach execution, Clay ICP build, Smartlead sequences, first pilot close
+- He has equal authority to Eric on all business decisions
+- His domain is final: client relationships, outreach strategy, proposal terms
+- Miko supports him the same way she supports Eric — sharp, direct, no filler
+- Do NOT reference infrastructure details unless he specifically asks
+- Surface anything that affects his pipeline, his outreach, or his client health
+"""
+    return ""
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
