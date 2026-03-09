@@ -48,6 +48,7 @@ from telegram.ext import (
 
 LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "http://172.23.0.1:11435")
 EMBED_SERVER_URL = os.getenv("EMBED_SERVER_URL", "http://172.23.0.1:11436")
+EMBED_MODEL      = os.getenv("EMBED_MODEL",        "nomic-embed-text")
 PLEADLY_API_URL  = os.getenv("PLEADLY_API_URL",  "http://172.23.0.1:8300")
 QDRANT_URL       = os.getenv("QDRANT_URL",        "http://qdrant:6333")
 QDRANT_API_KEY   = os.getenv("QDRANT_API_KEY",    None)
@@ -224,10 +225,57 @@ async def get_memories(user_id: str, query: str, limit: int = 6) -> list[str]:
         return []
     try:
         results = await asyncio.get_event_loop().run_in_executor(None, lambda: _memory.search(query=query, user_id=user_id, limit=limit))
+        if isinstance(results, list):
+            return [r["memory"] for r in results if "memory" in r]
         return [r["memory"] for r in results.get("results", [])]
     except Exception as e:
         logger.warning("Memory retrieval failed: %s", e)
         return []
+
+
+async def remember_fact(user_id: str, fact: str) -> bool:
+    """Write a fact directly to Qdrant, bypassing Mem0 LLM extraction.
+    Used for explicit Remember: commands — deterministic, never fails due to LLM."""
+    if not MEMORY_AVAILABLE or _memory is None:
+        return False
+    try:
+        import uuid, time
+        # Get embedding for the fact
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{EMBED_SERVER_URL}/v1/embeddings",
+                json={"model": EMBED_MODEL, "input": fact}
+            )
+            resp.raise_for_status()
+            vector = resp.json()["data"][0]["embedding"]
+
+        point_id = str(uuid.uuid4())
+        payload = {
+            "memory": fact,
+            "data": fact,
+            "user_id": user_id,
+            "created_at": int(time.time()),
+            "source": "explicit_remember",
+        }
+
+        # Write directly to Qdrant
+        qdrant_url = str(_memory.vector_store.client._client.base_url).rstrip("/")
+        api_key = _memory.vector_store.client.api_key or ""
+        headers = {"api-key": api_key, "Content-Type": "application/json"} if api_key else {"Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.put(
+                f"{qdrant_url}/collections/miko_memory/points?wait=true",
+                headers=headers,
+                json={"points": [{"id": point_id, "vector": vector, "payload": payload}]}
+            )
+            resp.raise_for_status()
+
+        logger.info("remember_fact: wrote '%s' for %s", fact[:60], user_id)
+        return True
+    except Exception as e:
+        logger.warning("remember_fact failed: %s", e)
+        return False
 
 
 async def save_memory(user_id: str, messages: list[dict]) -> None:
@@ -322,9 +370,12 @@ async def chat_with_miko(
 
     # Inject relevant memories
     memories = await get_memories(user_id=user_id, query=user_message)
+    logger.info("get_memories returned %d results for user=%s query=%s", len(memories), user_id, user_message[:30])
+    memory_block = ""
     if memories:
-        memory_block = "\n".join(f"- {m}" for m in memories)
-        system_parts.append(f"\n\n---\nWhat you remember about this person and context:\n{memory_block}")
+        mem_lines = "\n".join(f"- {m}" for m in memories[:5])
+        memory_block = f"\n\n---\nWhat you remember about {user_id}:\n{mem_lines}"
+        system_parts.append(memory_block)
 
     # Inject Pleadly status if requested or if message seems infra-related
     infra_keywords = ["pleadly", "status", "health", "pipeline", "api", "server", "running", "down",
@@ -437,7 +488,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Typing indicator
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    reply = await chat_with_miko(user_message=user_message, user_id=user_id)
+    # Intercept explicit Remember: commands — write directly, skip LLM extraction
+    if user_message.lower().startswith("remember:"):
+        fact = user_message[9:].strip().strip('"')
+        success = await remember_fact(user_id=user_id, fact=fact)
+        if success:
+            reply = f"✓ Logged: {fact}"
+        else:
+            reply = "⚠️ Failed to write that to memory — check logs."
+    else:
+        reply = await chat_with_miko(user_message=user_message, user_id=user_id)
 
     # Telegram has 4096 char limit — split if needed
     if len(reply) <= 4096:
