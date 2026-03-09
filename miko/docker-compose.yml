@@ -17,10 +17,12 @@ services:
       - ERIC_CHAT_ID=7355900090
       - DAVID_CHAT_ID=1697120532
       - MIKO_MODEL=Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+      - MASTER_POSTGRES_DSN=postgresql://awaas_master:c784b47fc96ec5fe8981a3fab61fec8e34936990755f3ad1c60438bc1bf8a2d2@master-postgres:5432/awaas_master
     networks:
       - awaas-shared
       - awaas-monitor
       - awaas-services
+      - awaas-orchestrator
     volumes:
       - ./SOUL.md:/app/SOUL.md:ro
       - ./static:/app/static:ro
@@ -36,4 +38,6 @@ networks:
   awaas-monitor:
     external: true
   awaas-services:
+    external: true
+  awaas-orchestrator:
     external: true

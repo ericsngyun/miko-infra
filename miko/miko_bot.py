@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+try:
+    import asyncpg as _asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    _asyncpg = None
+    ASYNCPG_AVAILABLE = False
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -51,6 +57,7 @@ DAVID_CHAT_ID    = int(os.getenv("DAVID_CHAT_ID",  "1697120532"))
 MODEL            = os.getenv("MIKO_MODEL",         "qwen3.5")
 
 SOUL_MD_PATH = Path(__file__).parent / "SOUL.md"
+MASTER_POSTGRES_DSN = os.getenv("MASTER_POSTGRES_DSN", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +75,55 @@ def load_soul() -> str:
     return "You are Miko, a sharp personal assistant for Eric at Miko Labs."
 
 SOUL = load_soul()
+
+# ---------------------------------------------------------------------------
+# Infrastructure state query — reads from master-postgres
+# ---------------------------------------------------------------------------
+
+async def get_infrastructure_state() -> str:
+    """Query infrastructure_state table and return formatted status block."""
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        return "Infrastructure state unavailable — no postgres connection configured."
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+        rows = await conn.fetch("""
+            SELECT service, status, last_checked,
+                   EXTRACT(EPOCH FROM (NOW() - last_checked))::int AS age_seconds,
+                   detail
+            FROM infrastructure_state
+            ORDER BY project_id NULLS LAST, service
+        """)
+        await conn.close()
+
+        if not rows:
+            return "No infrastructure state data available yet."
+
+        now = datetime.now(timezone.utc)
+        lines = [f"Infrastructure state (as of {now.strftime('%H:%M UTC')}):"]
+        all_ok = all(r["status"] == "ok" for r in rows)
+
+        for r in rows:
+            age = r["age_seconds"]
+            if age < 60:
+                age_str = f"{age}s ago"
+            elif age < 3600:
+                age_str = f"{age // 60}m ago"
+            else:
+                age_str = f"{age // 3600}h ago"
+
+            icon = "✅" if r["status"] == "ok" else "🔴"
+            lines.append(f"  {icon} {r['service']}: {r['status']} (checked {age_str})")
+
+        if all_ok:
+            lines.append(f"\nAll {len(rows)} services operational.")
+        else:
+            down = [r["service"] for r in rows if r["status"] != "ok"]
+            lines.append(f"\n⚠️ Degraded: {', '.join(down)}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning("Infrastructure state query failed: %s", e)
+        return f"Could not reach infrastructure state database: {e}"
 
 # ---------------------------------------------------------------------------
 # Mem0 memory layer
@@ -224,11 +280,14 @@ async def chat_with_miko(
         system_parts.append(f"\n\n---\nWhat you remember about this person and context:\n{memory_block}")
 
     # Inject Pleadly status if requested or if message seems infra-related
-    infra_keywords = ["pleadly", "status", "health", "pipeline", "api", "server", "running", "down"]
+    infra_keywords = ["pleadly", "status", "health", "pipeline", "api", "server", "running", "down",
+                       "node", "infrastructure", "services", "containers", "docker", "llama", "miko",
+                       "memory", "gpu", "ram", "queue", "up", "operational", "state"]
     if include_pleadly_status or any(k in user_message.lower() for k in infra_keywords):
         pleadly_status = await get_pleadly_status()
         status_str = format_pleadly_status(pleadly_status)
-        system_parts.append(f"\n\n---\nLive system status (just fetched):\n{status_str}")
+        infra_state = await get_infrastructure_state()
+        system_parts.append(f"\n\n---\nLive system status (just fetched):\n{status_str}\n\n{infra_state}")
 
     system_prompt = "".join(system_parts)
 
@@ -307,18 +366,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/status — live Pleadly + system status."""
+    """/status — live infrastructure state from master-postgres."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     status = await get_pleadly_status()
     status_str = format_pleadly_status(status)
+    infra_state = await get_infrastructure_state()
 
     chat_id = update.effective_chat.id
     user_id = get_user_id(chat_id)
 
     reply = await chat_with_miko(
-        user_message=f"Give me a status summary. Here's the live data:\n{status_str}",
+        user_message=f"Give me a status summary. Here's the live data:\n{status_str}\n\n{infra_state}",
         user_id=user_id,
-        include_pleadly_status=False,  # already injected above
+        include_pleadly_status=False,
     )
     await update.message.reply_text(reply)
 
