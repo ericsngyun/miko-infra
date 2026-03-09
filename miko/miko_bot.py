@@ -370,7 +370,6 @@ async def chat_with_miko(
 
     # Inject relevant memories
     memories = await get_memories(user_id=user_id, query=user_message)
-    logger.info("get_memories returned %d results for user=%s query=%s", len(memories), user_id, user_message[:30])
     memory_block = ""
     if memories:
         mem_lines = "\n".join(f"- {m}" for m in memories[:5])
