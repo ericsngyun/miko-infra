@@ -17,6 +17,8 @@ services:
       - ERIC_CHAT_ID=7355900090
       - DAVID_CHAT_ID=1697120532
       - MIKO_MODEL=Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf
+      - MIKO_FAST_MODEL=Qwen3.5-4B-Q4_K_M.gguf
+      - FAST_SERVER_URL=http://172.23.0.1:11437
       - MASTER_POSTGRES_DSN=postgresql://awaas_master:c784b47fc96ec5fe8981a3fab61fec8e34936990755f3ad1c60438bc1bf8a2d2@master-postgres:5432/awaas_master
     networks:
       - awaas-shared

@@ -55,6 +55,8 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ERIC_CHAT_ID     = int(os.getenv("ERIC_CHAT_ID",   "7355900090"))
 DAVID_CHAT_ID    = int(os.getenv("DAVID_CHAT_ID",  "1697120532"))
 MODEL            = os.getenv("MIKO_MODEL",         "qwen3.5")
+FAST_MODEL       = os.getenv("MIKO_FAST_MODEL",    "Qwen3.5-4B-Q4_K_M.gguf")
+FAST_SERVER_URL  = os.getenv("FAST_SERVER_URL",    "http://172.23.0.1:11437")
 
 SOUL_MD_PATH = Path(__file__).parent / "SOUL.md"
 MASTER_POSTGRES_DSN = os.getenv("MASTER_POSTGRES_DSN", "")
@@ -75,6 +77,40 @@ def load_soul() -> str:
     return "You are Miko, a sharp personal assistant for Eric at Miko Labs."
 
 SOUL = load_soul()
+
+# ---------------------------------------------------------------------------
+# Model router — zero latency keyword classifier
+# ---------------------------------------------------------------------------
+
+_FAST_PATTERNS = [
+    r"^(hey|hi|hello|sup|yo|morning|good morning|good night|gm|gn)[\s!?.]*$",
+    r"\b(status|up|down|running|health|alive|online)\b",
+    r"^(is|are|was|were|did|do|does|can|will|has|have)\s.{0,60}\?$",
+    r"\b(infrastructure|services|containers|node|server|postgres|redis|qdrant)\b",
+    r"^.{0,40}$",
+    r"^(ok|okay|got it|thanks|thank you|cool|nice|perfect|great|sounds good|makes sense)[\s!.]*$",
+    r"^(what time|what.s the time|what.s today|what day|who is|what is miko|what port).*$",
+]
+
+_DEEP_PATTERNS = [
+    r"\b(strategy|brainstorm|think|analyze|compare|should i|help me|design|architecture|plan|roadmap|decide|tradeoff|recommend|advice|why|explain|how do|how should|what do you think)\b",
+    r"\b(build|implement|code|write|create|draft|generate|debug|fix|refactor)\b",
+    r"\b(pleadly|awaas|koven|client|outreach|pipeline|revenue|post-[abcde])\b",
+    r".{200,}",
+]
+
+import re as _re
+
+def route_model(message: str) -> tuple[str, str]:
+    """Returns (model_name, server_url) based on message complexity."""
+    msg = message.lower().strip()
+    for pattern in _DEEP_PATTERNS:
+        if _re.search(pattern, msg, _re.IGNORECASE):
+            return MODEL, LLAMA_SERVER_URL
+    for pattern in _FAST_PATTERNS:
+        if _re.search(pattern, msg, _re.IGNORECASE):
+            return FAST_MODEL, FAST_SERVER_URL
+    return MODEL, LLAMA_SERVER_URL
 
 # ---------------------------------------------------------------------------
 # Infrastructure state query — reads from master-postgres
@@ -198,10 +234,16 @@ async def save_memory(user_id: str, messages: list[dict]) -> None:
     """Extract and save facts from conversation turn via Mem0."""
     if not MEMORY_AVAILABLE or _memory is None:
         return
-    try:
-        await asyncio.get_event_loop().run_in_executor(None, lambda: _memory.add(messages=messages, user_id=user_id))
-    except Exception as e:
-        logger.warning("Memory save failed: %s", e)
+    for attempt in range(3):
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, lambda: _memory.add(messages=messages, user_id=user_id))
+            return
+        except Exception as e:
+            if attempt < 2:
+                logger.warning("Memory save attempt %d failed: %s — retrying", attempt + 1, e)
+                await asyncio.sleep(1.0)
+            else:
+                logger.warning("Memory save failed after 3 attempts: %s", e)
 
 # ---------------------------------------------------------------------------
 # Pleadly status
@@ -301,12 +343,15 @@ async def chat_with_miko(
         {"role": "user", "content": user_message},
     ]
 
+    selected_model, selected_server = route_model(user_message)
+    logger.info("Model routing: %s -> :%s", selected_model[:25], selected_server.split(":")[-1])
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                f"{selected_server}/v1/chat/completions",
                 json={
-                    "model": MODEL,
+                    "model": selected_model,
                     "messages": messages,
                     "stream": False,
                     "temperature": 0.7,
