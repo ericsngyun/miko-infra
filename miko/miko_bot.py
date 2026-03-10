@@ -127,31 +127,44 @@ async def handle_approval_callback(update, context) -> None:
     chat_id = entry.get("chat_id", ERIC_CHAT_ID)
 
     if action == "deny":
-        await query.edit_message_text(f"❌ Denied: `{tool_name}`", parse_mode="Markdown")
+        await query.edit_message_text(f"Denied: {tool_name}")
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"⛔ Action `{tool_name}` was denied.",
-                parse_mode="Markdown",
+                text=f"Action {tool_name} was denied.",
             )
         except Exception:
             pass
         return
 
     # Approved — execute the tool
-    await query.edit_message_text(f"✅ Approved: `{tool_name}` — executing...", parse_mode="Markdown")
+    await query.edit_message_text(f"Approved: {tool_name} — executing...")
     try:
         result = await _dispatch_tool(tool_name, tool_args, user_id)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ `{tool_name}` complete:\n{result}",
-            parse_mode="Markdown",
-        )
+        # Strip chars that break Telegram plain-text parser
+        safe = (result
+            .replace("*","").replace("`","'")
+            .replace("_"," ").replace("[","(").replace("]",")")
+        )[:3000]
+        # Split into chunks if needed
+        header = f"Tool: {tool_name}
+
+"
+        full = header + safe
+        if len(full) <= 4096:
+            await context.bot.send_message(chat_id=chat_id, text=full)
+        else:
+            chunks = [full[i:i+3900] for i in range(0, len(full), 3900)]
+            for i, chunk in enumerate(chunks[:3]):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk if i == 0 else f"[cont {i+1}]
+{chunk}"
+                )
     except Exception as e:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ `{tool_name}` failed after approval: {e}",
-            parse_mode="Markdown",
+            text=f"Tool {tool_name} failed: {str(e)[:300]}",
         )
 
 def get_session_history(user_id: str) -> deque:
@@ -451,6 +464,17 @@ async def _tool_shell_exec(command: str) -> str:
 # ---------------------------------------------------------------------------
 # Web + AI tool implementations
 # ---------------------------------------------------------------------------
+
+def _safe_tg(text: str, max_len: int = 4000) -> str:
+    """Strip characters that break Telegram's text parser."""
+    return (text
+        .replace("*", "")
+        .replace("`", "'")
+        .replace("_", " ")
+        .replace("[", "(")
+        .replace("]", ")")
+    )[:max_len]
+
 
 async def _send_typing(chat_id: int, duration: float = 0):
     """Send typing action. If duration > 0, keep sending every 4s for that many seconds."""
