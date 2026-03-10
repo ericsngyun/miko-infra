@@ -1207,6 +1207,112 @@ def format_pleadly_status(status: dict[str, Any]) -> str:
 # LLM call
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# L3 — Reflection & Self-Correction
+# ---------------------------------------------------------------------------
+
+async def _reflect_on_tool_result(
+    goal: str,
+    tool_name: str,
+    tool_result: str,
+    iteration: int,
+) -> dict:
+    """
+    After a tool executes, ask the fast model: is this result sufficient?
+    Returns {"sufficient": bool, "gap": str, "suggestion": str}
+    """
+    # Skip reflection for cheap/fast tools — not worth the latency
+    if tool_name in ("task_list", "infra_query", "remember", "task_add", "task_update"):
+        return {"sufficient": True, "gap": "", "suggestion": ""}
+    # Don't reflect on pending approvals or iteration 0 of simple ops
+    if "⏳" in tool_result or iteration == 0 and tool_name not in ("web_search", "web_fetch", "research"):
+        return {"sufficient": True, "gap": "", "suggestion": ""}
+
+    prompt = f"""You are a critic evaluating whether a tool result adequately addresses the user's goal.
+
+User goal: {goal[:300]}
+Tool used: {tool_name}
+Tool result (truncated): {tool_result[:800]}
+Iteration: {iteration}
+
+Answer in JSON only, no other text:
+{{
+  "sufficient": true/false,
+  "gap": "what is still missing or unclear (empty string if sufficient)",
+  "suggestion": "what tool or approach to try next (empty string if sufficient)"
+}}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.post(
+                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                }
+            )
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown fences if present
+            raw = re.sub(r"```json|```", "", raw).strip()
+            return json.loads(raw)
+    except Exception as e:
+        logger.debug("Reflection failed (non-critical): %s", e)
+        return {"sufficient": True, "gap": "", "suggestion": ""}
+
+
+async def _critic_pass(
+    user_message: str,
+    response: str,
+    tool_results: list[str],
+) -> dict:
+    """
+    Final quality check on Miko's response before sending to user.
+    Returns {"pass": bool, "issue": str, "rewrite_instruction": str}
+    Only triggers for substantive responses (>100 chars) to avoid overhead on short replies.
+    """
+    if len(response) < 100 or not tool_results:
+        return {"pass": True, "issue": "", "rewrite_instruction": ""}
+
+    tools_summary = "\n".join(f"- {r[:200]}" for r in tool_results[-3:])
+    prompt = f"""You are a quality critic for an AI assistant named Miko.
+
+User asked: {user_message[:300]}
+Miko responded: {response[:600]}
+Tools used produced: {tools_summary}
+
+Is Miko's response accurate, complete, and directly useful? Check for:
+- Hallucinated facts not in tool results
+- Missing critical information that was in the tool results
+- Vague non-answers when concrete data was available
+
+Answer in JSON only:
+{{
+  "pass": true/false,
+  "issue": "specific problem if failed (empty if pass)",
+  "rewrite_instruction": "what to fix if failed (empty if pass)"
+}}"""
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.post(
+                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1,
+                }
+            )
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            raw = re.sub(r"```json|```", "", raw).strip()
+            return json.loads(raw)
+    except Exception as e:
+        logger.debug("Critic pass failed (non-critical): %s", e)
+        return {"pass": True, "issue": "", "rewrite_instruction": ""}
+
+
 async def chat_with_miko(
     user_message: str,
     user_id: str,
@@ -1218,10 +1324,11 @@ async def chat_with_miko(
     Architecture:
     1. Build system prompt: SOUL + principal context + datetime + memories + infra
     2. Inject session history for conversational continuity
-    3. Call 35B with tools array (Hermes-style tool calling)
-    4. If model requests a tool call: execute it, inject result, re-call for final response
-    5. Save exchange to session history + Mem0
-    6. Max 5 tool call iterations per message to prevent runaway loops
+    3. Call 35B with tools array (native tool_calls format)
+    4. If model requests a tool call: execute it, reflect on result (L3), inject, re-call
+    5. After final response: critic pass validates quality (L3), regenerates if needed
+    6. Save exchange to session history + Mem0
+    7. Max 5 tool call iterations per message to prevent runaway loops
     """
     # ── Build system prompt ────────────────────────────────────────────────
     system_parts = [SOUL]
@@ -1318,6 +1425,18 @@ After the tool result is returned, synthesize a natural response. Never fabricat
                         final_reply = tool_result
                         break
 
+                    # ── L3: Reflect on tool result — is it sufficient? ─────
+                    reflection = await _reflect_on_tool_result(
+                        goal=user_message,
+                        tool_name=tool_name,
+                        tool_result=tool_result,
+                        iteration=tool_iterations,
+                    )
+                    if not reflection.get("sufficient") and reflection.get("suggestion") and tool_iterations < MAX_TOOL_ITERATIONS - 1:
+                        logger.info("L3 reflection: gap=%s suggestion=%s", reflection.get("gap","")[:80], reflection.get("suggestion","")[:80])
+                        # Inject reflection hint into tool result so model knows to go deeper
+                        tool_result = tool_result + f"\n\n[REFLECTION: The above may be incomplete. Gap: {reflection['gap']}. Consider: {reflection['suggestion']}]"
+
                     # Append assistant tool call + tool result to messages
                     messages.append(msg)
                     messages.append({
@@ -1347,9 +1466,32 @@ After the tool result is returned, synthesize a natural response. Never fabricat
                         continue
                     except Exception as e:
                         logger.warning("XML tool parse failed: %s", e)
+                        # L3: inject parse failure so model can self-correct
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({"role": "user", "content": f"[SYSTEM: Tool call parse failed: {e}. Please reformat your tool call correctly and try again.]"})
+                        tool_iterations += 1
+                        continue
 
                 # ── Path C: no tool call — final response ──────────────────
                 final_reply = content.strip()
+
+                # ── L3: Critic pass — verify response quality ─────────────
+                if tool_iterations > 0:  # only run critic if tools were used
+                    tool_results_log = [
+                        m.get("content", "") for m in messages
+                        if m.get("role") == "tool"
+                    ]
+                    critic = await _critic_pass(user_message, final_reply, tool_results_log)
+                    if not critic.get("pass") and critic.get("rewrite_instruction") and tool_iterations < MAX_TOOL_ITERATIONS:
+                        logger.info("L3 critic failed — rewriting. Issue: %s", critic.get("issue","")[:100])
+                        # Inject critic feedback and regenerate once
+                        messages.append({"role": "assistant", "content": final_reply})
+                        messages.append({
+                            "role": "user",
+                            "content": f"[SELF-CORRECTION]: Your response has an issue: {critic['issue']}. Fix: {critic['rewrite_instruction']}. Rewrite your response addressing this."
+                        })
+                        tool_iterations += 1
+                        continue  # loop back for one correction pass
                 break
 
             else:
