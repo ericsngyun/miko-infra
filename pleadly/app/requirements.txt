@@ -12,3 +12,4 @@ pydantic-settings>=2.5
 pytesseract>=0.3.13
 pypdf2>=3.0
 httpx>=0.28
+anthropic>=0.40.0

@@ -85,6 +85,7 @@ services:
       - QDRANT_API_KEY=${PLEADLY_QDRANT_API_KEY}
       - PLEADLY_HMAC_SECRET=${PLEADLY_HMAC_SECRET}
       - DATA_CLASS=PRIVILEGED
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     networks:
       - pleadly-net
       - shared-net          # needs LLM Gateway
