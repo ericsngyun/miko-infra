@@ -1417,8 +1417,8 @@ async def remember_fact(user_id: str, fact: str) -> bool:
         }
 
         # Write directly to Qdrant
-        qdrant_url = str(_memory.vector_store.client._client.base_url).rstrip("/")
-        api_key = _memory.vector_store.client.api_key or ""
+        qdrant_url = os.getenv("QDRANT_URL", "http://awaas-qdrant:6333").rstrip("/")
+        api_key = os.getenv("QDRANT_API_KEY", "")
         headers = {"api-key": api_key, "Content-Type": "application/json"} if api_key else {"Content-Type": "application/json"}
 
         async with httpx.AsyncClient(timeout=10.0) as client:
