@@ -223,7 +223,7 @@ async def main() -> None:
     scheduler.add_job(
         daily_brief_job,
         "cron",
-        hour=9,
+        hour=17,
         minute=0,
         id="daily_brief",
     )
