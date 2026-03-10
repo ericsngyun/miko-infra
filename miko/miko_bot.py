@@ -452,6 +452,27 @@ async def _tool_shell_exec(command: str) -> str:
 # Web + AI tool implementations
 # ---------------------------------------------------------------------------
 
+async def _send_typing(chat_id: int, duration: float = 0):
+    """Send typing action. If duration > 0, keep sending every 4s for that many seconds."""
+    if not _tg_bot:
+        return
+    if duration <= 0:
+        try:
+            await _tg_bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        return
+    async def _loop():
+        elapsed = 0.0
+        while elapsed < duration:
+            try:
+                await _tg_bot.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                pass
+            await asyncio.sleep(4.0)
+            elapsed += 4.0
+    asyncio.create_task(_loop())
+
 async def _tool_web_fetch(url: str, summary: bool = False) -> str:
     """Fetch and extract clean text from a URL using trafilatura."""
     try:
@@ -509,16 +530,77 @@ async def _tool_web_fetch(url: str, summary: bool = False) -> str:
 async def _tool_web_search(query: str, max_results: int = 5) -> str:
     """Search the web via DuckDuckGo HTML (no API key required)."""
     try:
+        import random
+        from bs4 import BeautifulSoup as _BS
         max_results = min(max_results, 10)
-        search_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MikoBot/1.0)"}) as client:
-            resp = await client.get(search_url)
-            resp.raise_for_status()
+        encoded = query.replace(' ', '+')
+        uas = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        ]
 
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp.text, "lxml")
+        async def _try_ddg(q_encoded: str):
+            for attempt in range(2):
+                async with httpx.AsyncClient(timeout=12.0, follow_redirects=True,
+                    headers={"User-Agent": random.choice(uas),
+                             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                             "Accept-Language": "en-US,en;q=0.5", "DNT": "1"}) as c:
+                    r = await c.get(f"https://html.duckduckgo.com/html/?q={q_encoded}")
+                if r.status_code == 200:
+                    return r
+                await asyncio.sleep(2.0)
+            return None
+
+        async def _try_brave(q_encoded: str):
+            """Brave search HTML — no API key needed."""
+            try:
+                async with httpx.AsyncClient(timeout=12.0, follow_redirects=True,
+                    headers={"User-Agent": random.choice(uas),
+                             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                             "Accept-Language": "en-US,en;q=0.5"}) as c:
+                    r = await c.get(f"https://search.brave.com/search?q={q_encoded}&source=web")
+                if r.status_code == 200:
+                    return r
+            except Exception:
+                pass
+            return None
+
+        # Try DDG first, then Brave
+        resp = await _try_ddg(encoded)
+        backend = "ddg"
+        if not resp:
+            resp = await _try_brave(encoded)
+            backend = "brave"
+        if not resp:
+            return f"web_search unavailable (all backends rate-limited) for: {query}"
+
+        soup = _BS(resp.text, "lxml")
         results = []
+        if backend == "ddg":
+            for r in soup.select(".result")[:max_results]:
+                title_el = r.select_one(".result__title")
+                snippet_el = r.select_one(".result__snippet")
+                url_el = r.select_one(".result__url")
+                title = title_el.get_text(strip=True) if title_el else "No title"
+                snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                url = url_el.get_text(strip=True) if url_el else ""
+                results.append(f"**{title}**\n{url}\n{snippet}")
+        else:  # brave — JS-rendered, extract URLs from cite tags
+            seen = set()
+            for r in soup.select(".snippet")[:max_results * 2]:
+                url_el = r.select_one("cite")
+                if not url_el:
+                    continue
+                raw_url = url_el.get_text(strip=True).replace(" ", "").replace("›", "/")
+                # Reconstruct full URL
+                if raw_url and not raw_url.startswith("http"):
+                    raw_url = "https://" + raw_url
+                if raw_url and raw_url not in seen:
+                    seen.add(raw_url)
+                    results.append(f"**{raw_url}**\n{raw_url}\n")
+                if len(results) >= max_results:
+                    break
         for r in soup.select(".result")[:max_results]:
             title_el = r.select_one(".result__title")
             snippet_el = r.select_one(".result__snippet")
@@ -581,27 +663,82 @@ async def _tool_research(goal: str, depth: str = "standard", user_id: str = "eri
         try:
             logger = logging.getLogger("miko.research")
             logger.info("Research task %s started: %s", task_id, goal)
+            chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
 
-            # Step 1: Search
-            search_results = await _tool_web_search(goal, max_results=n_sources)
+            async def _status(msg: str):
+                """Send a brief status update and typing indicator."""
+                if _tg_bot:
+                    try:
+                        await _tg_bot.send_message(chat_id=chat_id, text=msg)
+                        await _tg_bot.send_chat_action(chat_id=chat_id, action="typing")
+                    except Exception:
+                        pass
 
-            # Step 2: Extract URLs from search results
+            await _status(f"🔍 Starting research [{task_id}]...")
+
+            # Step 1: Decompose goal into 2-3 short search queries via fast model
+            decompose_prompt = f"""Break this research goal into 2-3 short, specific web search queries (1-6 words each).
+Return ONLY the queries, one per line, no numbering, no explanation.
+
+Goal: {goal}"""
+            async with httpx.AsyncClient(timeout=30.0) as _dc:
+                _dr = await _dc.post(
+                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                    json={
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": decompose_prompt}],
+                        "max_tokens": 80,
+                        "temperature": 0.2,
+                    }
+                )
+                raw_queries = _dr.json()["choices"][0]["message"]["content"].strip()
+            search_queries = [q.strip() for q in raw_queries.split("\n") if q.strip() and len(q.strip()) > 3][:3]
+            if not search_queries:
+                search_queries = [goal[:60]]
+            logger.info("Research %s queries: %s", task_id, search_queries)
+            await _status(f"🔎 Searching: {' | '.join(search_queries)}")
+
+            # Step 2: Search each query, collect all results
+            all_search_results = []
             urls = []
-            for line in search_results.split("\n"):
-                line = line.strip()
-                if line.startswith("http") and len(line) < 200:
-                    urls.append(line)
+            for sq in search_queries:
+                sr = await _tool_web_search(sq, max_results=max(2, n_sources // len(search_queries)))
+                all_search_results.append(sr)
+                for line in sr.split("\n"):
+                    line = line.strip()
+                    if line.startswith("http") and len(line) < 200:
+                        urls.append(line)
+                await asyncio.sleep(0.8)
+            search_results = "\n\n".join(all_search_results)
 
-            # Step 3: Fetch and extract content from top URLs
+            # Step 3: Inject known authoritative URLs based on goal keywords
+            known_urls = []
+            goal_lower = goal.lower()
+            if "caseflood" in goal_lower:
+                known_urls = [
+                    "https://www.ycombinator.com/companies/caseflood-ai",
+                    "https://caseflood.ai",
+                    "https://www.linkedin.com/company/caseflood",
+                ]
+            elif "evenup" in goal_lower:
+                known_urls = ["https://www.ycombinator.com/companies/evenup", "https://www.evenuplaw.com"]
+            # Dedupe and prepend known URLs
+            for ku in reversed(known_urls):
+                if ku not in urls:
+                    urls.insert(0, ku)
+
+            # Step 4: Fetch and extract content from top URLs
+            await _status(f"📄 Fetching {min(len(urls), n_sources)} sources...")
             fetched = []
             for url in urls[:n_sources]:
                 text = await _tool_web_fetch(url, summary=True)
-                if "error" not in text.lower():
+                if "error" not in text.lower() and "could not extract" not in text.lower():
                     fetched.append(f"Source: {url}\n{text}")
                 await asyncio.sleep(0.5)  # polite crawl delay
 
             # Step 4: Synthesize with 35B
             if fetched:
+                await _status(f"🧠 Synthesizing {len(fetched)} sources...")
                 combined = "\n\n---\n\n".join(fetched[:n_sources])
                 synthesis_prompt = f"""You are Miko, a strategic intelligence assistant for Koven Labs.
 
@@ -638,22 +775,26 @@ Be direct, factual, and cut anything that isn't immediately useful."""
             _research_tasks[task_id] = "done"
             logger.info("Research task %s complete", task_id)
 
-            # Notify via Telegram
-            chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
+            # Notify via Telegram — plain text to avoid Markdown parse errors in LLM output
             if _tg_bot:
-                # Split if too long
-                header = f"🔬 *Research Complete* `[{task_id}]`\n*Goal:* {goal}\n\n"
-                full_msg = header + brief
+                header = f"🔬 Research Complete [{task_id}]\nGoal: {goal}\n\n"
+                # Strip markdown symbols that break Telegram parser
+                clean_brief = brief.replace("**", "").replace("__", "").replace("`", "'")
+                full_msg = header + clean_brief
+                # Telegram 4096 char limit — split if needed
                 if len(full_msg) <= 4096:
-                    await _tg_bot.send_message(chat_id=chat_id, text=full_msg, parse_mode="Markdown")
+                    await _tg_bot.send_message(chat_id=chat_id, text=full_msg)
                 else:
-                    await _tg_bot.send_message(chat_id=chat_id, text=header + brief[:3800] + "\n\n_[truncated]_", parse_mode="Markdown")
+                    chunks = [full_msg[i:i+4000] for i in range(0, min(len(full_msg), 12000), 4000)]
+                    for i, chunk in enumerate(chunks):
+                        prefix = "" if i == 0 else f"[{task_id} cont'd {i+1}]\n"
+                        await _tg_bot.send_message(chat_id=chat_id, text=prefix + chunk)
+                        await asyncio.sleep(0.3)
 
         except Exception as e:
             _research_tasks[task_id] = f"error: {e}"
             logging.getLogger("miko.research").error("Research task %s failed: %s", task_id, e)
             if _tg_bot:
-                chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
                 await _tg_bot.send_message(
                     chat_id=chat_id,
                     text=f"⚠️ Research task `{task_id}` failed: {e}",
@@ -1129,6 +1270,9 @@ After the tool result is returned, synthesize a natural response. Never fabricat
     selected_model = MODEL
     selected_server = LLAMA_SERVER_URL
     logger.info("Agent call: model=%s", selected_model[:30])
+    # Keep typing indicator alive during inference
+    _typing_chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
+    asyncio.create_task(_send_typing(_typing_chat_id, duration=60))
 
     # ── Agent loop — max 5 tool call iterations ────────────────────────────
     final_reply = ""
