@@ -86,9 +86,11 @@ services:
       - PLEADLY_HMAC_SECRET=${PLEADLY_HMAC_SECRET}
       - DATA_CLASS=PRIVILEGED
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - MASTER_POSTGRES_DSN=${MASTER_POSTGRES_DSN}
     networks:
       - pleadly-net
       - shared-net          # needs LLM Gateway
+      - orchestrator-net    # master-postgres cost logging
     depends_on:
       pleadly-postgres:
         condition: service_healthy
@@ -162,6 +164,9 @@ networks:
   pleadly-net:
     name: awaas-pleadly
     # ISOLATED: No cross-stack network path to awaas-services or trading
+  orchestrator-net:
+    external: true
+    name: awaas-orchestrator
   shared-net:
     external: true
     name: awaas-shared
