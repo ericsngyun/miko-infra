@@ -1,0 +1,4 @@
+[safe]
+    directory = /awaas
+    directory = /awaas/miko
+    directory = /workspace

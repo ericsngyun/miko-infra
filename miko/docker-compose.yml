@@ -37,6 +37,12 @@ services:
       - /home/miko_node_001/awaas/workspace:/workspace:rw
       - /home/miko_node_001/awaas:/awaas:ro
       - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/bin/git:/usr/bin/git:ro
+      - /usr/lib/git-core:/usr/lib/git-core:ro
+      - /usr/share/git-core:/usr/share/git-core:ro
+      - /lib/x86_64-linux-gnu/libpcre2-8.so.0:/lib/x86_64-linux-gnu/libpcre2-8.so.0:ro
+      - /lib/x86_64-linux-gnu/libz.so.1:/lib/x86_64-linux-gnu/libz.so.1:ro
+      - /home/miko_node_001/awaas/miko/.gitconfig:/root/.gitconfig:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8400/health')"]
       interval: 30s
