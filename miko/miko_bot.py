@@ -141,15 +141,41 @@ async def handle_approval_callback(update, context) -> None:
     await query.edit_message_text(f"Approved: {tool_name} — executing...")
     try:
         result = await _dispatch_tool(tool_name, tool_args, user_id)
-        # Strip chars that break Telegram plain-text parser
+
+        # ── Resume agent loop if we have saved context ─────────────────
+        saved = _pending_contexts.pop(approval_id, None)
+        if saved:
+            # Inject real tool result into saved messages
+            resume_messages = saved["messages"]
+            for m in reversed(resume_messages):
+                if m.get("content") == "__PENDING__":
+                    m["content"] = result
+                    break
+            # Re-enter chat_with_miko synthesis — skip tool calls, just synthesize
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                synthesis = await _resume_after_approval(
+                    messages=resume_messages,
+                    user_id=saved["user_id"],
+                    user_message=saved["user_message"],
+                )
+                if synthesis:
+                    safe_synth = (synthesis
+                        .replace("*","").replace("`","'")
+                        .replace("_"," ").replace("[","(").replace("]",")")
+                    )[:4000]
+                    await context.bot.send_message(chat_id=chat_id, text=safe_synth)
+                    return  # synthesis sent, skip raw result dump
+            except Exception as se:
+                logger.warning("Resume synthesis failed: %s", se)
+                # Fall through to raw result dump
+
+        # Fallback: send raw result if no context or synthesis failed
         safe = (result
             .replace("*","").replace("`","'")
             .replace("_"," ").replace("[","(").replace("]",")")
         )[:3000]
-        # Split into chunks if needed
-        header = f"Tool: {tool_name}
-
-"
+        header = f"Tool: {tool_name}\n\n"
         full = header + safe
         if len(full) <= 4096:
             await context.bot.send_message(chat_id=chat_id, text=full)
@@ -158,8 +184,7 @@ async def handle_approval_callback(update, context) -> None:
             for i, chunk in enumerate(chunks[:3]):
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=chunk if i == 0 else f"[cont {i+1}]
-{chunk}"
+                    text=chunk if i == 0 else f"[cont {i+1}] " + chunk,
                 )
     except Exception as e:
         await context.bot.send_message(
@@ -672,6 +697,9 @@ async def _tool_claude_query(prompt: str, context: str = "", max_tokens: int = 2
 # Active research tasks: task_id → status
 _research_tasks: dict[str, str] = {}
 
+# Pending approval conversation contexts: approval_id → {messages, user_id, user_message}
+_pending_contexts: dict[str, dict] = {}
+
 async def _tool_research(goal: str, depth: str = "standard", user_id: str = "eric") -> str:
     """
     Spin up an async research loop. Returns immediately with a task ID.
@@ -827,6 +855,40 @@ Be direct, factual, and cut anything that isn't immediately useful."""
 
     asyncio.create_task(_run_research())
     return f"🔬 Research task `{task_id}` started ({depth}, ~{n_sources} sources).\nGoal: {goal}\n\nI\'ll ping you when the brief is ready."
+
+
+async def _resume_after_approval(
+    messages: list[dict],
+    user_id: str,
+    user_message: str,
+) -> str:
+    """
+    Re-enter the LLM after an approval callback to synthesize a final response.
+    Uses the full conversation context including the now-resolved tool result.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                json={
+                    "model": MODEL,
+                    "messages": messages,
+                    "tools": MIKO_TOOLS,
+                    "tool_choice": "none",  # force final response, no more tool calls
+                    "stream": False,
+                    "temperature": 0.7,
+                    "max_tokens": 1024,
+                },
+            )
+            resp.raise_for_status()
+            reply = resp.json()["choices"][0]["message"].get("content", "").strip()
+            # Save to session history
+            append_to_history(user_id, "user", user_message)
+            append_to_history(user_id, "assistant", reply)
+            return reply
+    except Exception as e:
+        logger.error("_resume_after_approval failed: %s", e)
+        return ""
 
 
 async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
@@ -1444,8 +1506,24 @@ After the tool result is returned, synthesize a natural response. Never fabricat
                     logger.info("Tool call (native): %s %s", tool_name, tool_args)
                     tool_result = await execute_tool(tool_name, tool_args, user_id, bot=_tg_bot)
 
-                    # If tool is pending approval, return holding message immediately
+                    # If tool is pending approval, save context and return holding message
                     if tool_result.startswith("⏳ Waiting for approval"):
+                        # Extract approval ID from result e.g. "⏳ Waiting for approval `[abc123]`"
+                        approval_id_match = re.search(r"\[([a-f0-9]+)\]", tool_result)
+                        if approval_id_match:
+                            approval_id = approval_id_match.group(1)
+                            # Save full message context so we can resume after approval
+                            _pending_contexts[approval_id] = {
+                                "messages": messages + [msg, {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.get("id", "call_0"),
+                                    "content": "__PENDING__",  # placeholder, filled on approval
+                                }],
+                                "user_id": user_id,
+                                "user_message": user_message,
+                                "tool_name": tool_name,
+                            }
+                            logger.info("Saved context for approval %s", approval_id)
                         final_reply = tool_result
                         break
 
