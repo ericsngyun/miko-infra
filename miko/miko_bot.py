@@ -942,6 +942,7 @@ def _safe_read_path(path: str) -> bool:
         "/awaas/orchestrator/conductor/main.py",
         "/awaas/orchestrator/conductor/settings.py",
         "/awaas/pleadly",
+        "/pleadly-repo",
         "/awaas/.env.template",
         "/tmp/",
     ]

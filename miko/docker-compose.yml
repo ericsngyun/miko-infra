@@ -36,6 +36,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /home/miko_node_001/awaas/workspace:/workspace:rw
       - /home/miko_node_001/awaas:/awaas:ro
+      - /home/miko_node_001/pleadly-repo:/pleadly-repo:ro
       - /usr/bin/docker:/usr/bin/docker:ro
       - /usr/bin/git:/usr/bin/git:ro
       - /usr/lib/git-core:/usr/lib/git-core:ro
