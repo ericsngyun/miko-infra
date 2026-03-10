@@ -519,12 +519,14 @@ SHELL_ALLOWED_PREFIXES = [
     "cat /var/log", "cat /home/miko_node_001",
     "ls ", "pwd", "uptime", "uname",
     "curl http://172.", "curl http://localhost",
+    "find /pleadly-repo", "find /awaas", "find /workspace",
+    "wc ", "head ", "tail ", "grep ",
 ]
 
 def _shell_allowed(command: str) -> bool:
     cmd = command.strip().lower()
     # Block dangerous ops
-    for blocked in ["rm ", "sudo ", "chmod ", "chown ", "curl http", "wget ", "> /", "dd ", "mkfs"]:
+    for blocked in ["rm ", "sudo ", "chmod ", "chown ", "wget ", "> /", "dd ", "mkfs"]:
         if blocked in cmd:
             return False
     for prefix in SHELL_ALLOWED_PREFIXES:
