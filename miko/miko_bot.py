@@ -864,17 +864,30 @@ async def _resume_after_approval(
 ) -> str:
     """
     Re-enter the LLM after an approval callback to synthesize a final response.
-    Uses the full conversation context including the now-resolved tool result.
+    Strips tools array entirely and adds explicit synthesis instruction to force
+    a plain text response — local model ignores tool_choice="none".
     """
     try:
+        # Build synthesis-only messages — no tools, explicit instruction
+        synth_messages = [m for m in messages if m.get("role") != "system"]
+
+        # Prepend a minimal system prompt focused only on synthesis
+        synth_system = (
+            f"{SOUL}\n\n"
+            "IMPORTANT: You have just received tool results. "
+            "Do NOT call any more tools. Do NOT output <tool_call> or function call syntax. "
+            "Synthesize the tool results into a clear, direct response to the user. "
+            "Plain text only."
+        )
+        final_messages = [{"role": "system", "content": synth_system}] + synth_messages
+
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(
                 f"{LLAMA_SERVER_URL}/v1/chat/completions",
                 json={
                     "model": MODEL,
-                    "messages": messages,
-                    "tools": MIKO_TOOLS,
-                    "tool_choice": "none",  # force final response, no more tool calls
+                    "messages": final_messages,
+                    # No tools array — removes possibility of tool calls entirely
                     "stream": False,
                     "temperature": 0.7,
                     "max_tokens": 1024,
@@ -882,9 +895,26 @@ async def _resume_after_approval(
             )
             resp.raise_for_status()
             reply = resp.json()["choices"][0]["message"].get("content", "").strip()
+
+            # Strip any XML tool call syntax the model generated anyway
+            reply = re.sub(r"<tool_call>.*?</tool_call>", "", reply, flags=re.DOTALL)
+            reply = re.sub(r"<function=.*?</function>", "", reply, flags=re.DOTALL)
+            reply = re.sub(r"<parameter=.*?</parameter>", "", reply, flags=re.DOTALL)
+            reply = reply.strip()
+
+            if not reply:
+                return ""
+
             # Save to session history
             append_to_history(user_id, "user", user_message)
             append_to_history(user_id, "assistant", reply)
+            asyncio.create_task(save_memory(
+                user_id=user_id,
+                messages=[
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": reply},
+                ],
+            ))
             return reply
     except Exception as e:
         logger.error("_resume_after_approval failed: %s", e)
