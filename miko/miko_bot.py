@@ -98,6 +98,10 @@ TOOL_PERMISSION_TIER: dict[str, str] = {
     "task_add":    "yellow",
     "task_update": "yellow",
     "shell_exec":  "yellow",
+    "write_file":  "yellow",
+    "git_status":  "green",
+    "read_file":   "green",
+    "git_commit":  "red",
 }
 
 # Pending approvals: uuid → {tool_name, tool_args, user_id, event, result, approved}
@@ -350,6 +354,65 @@ MIKO_TOOLS = [
                     "depth":   {"type": "string", "enum": ["quick", "standard", "deep"], "description": "quick=3 sources, standard=8 sources, deep=15+ sources"},
                 },
                 "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file. Restricted to /workspace and known config/log paths under /awaas. Use to inspect code, configs, logs before making changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to file"},
+                    "lines": {"type": "integer", "description": "Max lines to return. Default 200."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or overwrite a file. ONLY allowed in /workspace directory. Use for creating scripts, configs, drafts. Never writes outside /workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Absolute path under /workspace/"},
+                    "content": {"type": "string", "description": "Full file content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Run git status and git diff --stat in a repository. Read-only. Use before proposing changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo path. Options: miko, pleadly, miko-infra. Default: miko-infra"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_commit",
+            "description": "Stage all changes and commit in a repository. RED tier — always requires explicit approval. Shows diff before committing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo":    {"type": "string", "description": "Repo path. Options: miko, pleadly, miko-infra"},
+                    "message": {"type": "string", "description": "Commit message"},
+                },
+                "required": ["repo", "message"],
             },
         },
     },
@@ -857,6 +920,114 @@ Be direct, factual, and cut anything that isn't immediately useful."""
     return f"🔬 Research task `{task_id}` started ({depth}, ~{n_sources} sources).\nGoal: {goal}\n\nI\'ll ping you when the brief is ready."
 
 
+# ---------------------------------------------------------------------------
+# L4 — Autonomous Build Agent Tools
+# ---------------------------------------------------------------------------
+
+WORKSPACE_DIR = "/workspace"
+REPO_PATHS = {
+    "miko":      "/awaas/miko",
+    "pleadly":   "/awaas/pleadly",
+    "miko-infra": "/awaas",
+}
+
+def _safe_read_path(path: str) -> bool:
+    """Return True if path is safe to read."""
+    allowed_prefixes = [
+        WORKSPACE_DIR,
+        "/awaas/miko/miko_bot.py",
+        "/awaas/miko/docker-compose.yml",
+        "/awaas/miko/requirements.txt",
+        "/awaas/miko/SOUL.md",
+        "/awaas/orchestrator/conductor/main.py",
+        "/awaas/orchestrator/conductor/settings.py",
+        "/awaas/pleadly",
+        "/awaas/.env.template",
+        "/tmp/",
+    ]
+    return any(path.startswith(p) for p in allowed_prefixes)
+
+
+async def _tool_read_file(path: str, lines: int = 200) -> str:
+    """Read file contents, restricted to safe paths."""
+    if not _safe_read_path(path):
+        return f"Access denied: {path} is outside allowed read paths. Use /workspace/ or known config paths."
+    try:
+        import aiofiles
+        async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = await f.readlines()
+        total = len(all_lines)
+        selected = all_lines[:lines]
+        result = "".join(selected)
+        if total > lines:
+            result += f"\n... [{total - lines} more lines]"
+        return f"[{path}] ({total} lines total)\n\n{result}"
+    except FileNotFoundError:
+        return f"File not found: {path}"
+    except Exception as e:
+        return f"read_file error: {e}"
+
+
+async def _tool_write_file(path: str, content: str) -> str:
+    """Write file, strictly sandboxed to /workspace."""
+    if not path.startswith(WORKSPACE_DIR):
+        return f"Write denied: {path} is outside /workspace. Miko only writes to /workspace/."
+    try:
+        import aiofiles, os
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else WORKSPACE_DIR, exist_ok=True)
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(content)
+        lines = content.count("\n") + 1
+        return f"Written: {path} ({lines} lines, {len(content)} bytes)"
+    except Exception as e:
+        return f"write_file error: {e}"
+
+
+async def _tool_git_status(repo: str = "miko-infra") -> str:
+    """Run git status + diff --stat in a repo."""
+    repo_path = REPO_PATHS.get(repo, REPO_PATHS["miko-infra"])
+    try:
+        import subprocess
+        result = []
+        for cmd in [
+            ["git", "-C", repo_path, "status", "--short"],
+            ["git", "-C", repo_path, "log", "--oneline", "-5"],
+            ["git", "-C", repo_path, "diff", "--stat"],
+        ]:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if r.stdout.strip():
+                result.append("$ " + " ".join(cmd[2:]) + "\n" + r.stdout.strip())
+        return "\n\n".join(result) if result else f"Repo {repo} is clean."
+    except Exception as e:
+        return f"git_status error: {e}"
+
+
+async def _tool_git_commit(repo: str, message: str) -> str:
+    """Stage all and commit. RED tier — only runs after explicit approval."""
+    repo_path = REPO_PATHS.get(repo, REPO_PATHS["miko-infra"])
+    try:
+        import subprocess
+        # Show diff first
+        diff = subprocess.run(
+            ["git", "-C", repo_path, "diff", "--stat", "HEAD"],
+            capture_output=True, text=True, timeout=10
+        )
+        stage = subprocess.run(
+            ["git", "-C", repo_path, "add", "-A"],
+            capture_output=True, text=True, timeout=10
+        )
+        commit = subprocess.run(
+            ["git", "-C", repo_path, "commit", "-m", message],
+            capture_output=True, text=True, timeout=15
+        )
+        if commit.returncode == 0:
+            return f"Committed in {repo}:\n{commit.stdout.strip()}\n\nDiff summary:\n{diff.stdout.strip() or 'no unstaged changes'}"
+        else:
+            return f"Commit failed:\n{commit.stderr.strip()}"
+    except Exception as e:
+        return f"git_commit error: {e}"
+
+
 async def _resume_after_approval(
     messages: list[dict],
     user_id: str,
@@ -944,6 +1115,14 @@ async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
         return await _tool_claude_query(**tool_args)
     elif tool_name == "research":
         return await _tool_research(user_id=user_id, **tool_args)
+    elif tool_name == "read_file":
+        return await _tool_read_file(**tool_args)
+    elif tool_name == "write_file":
+        return await _tool_write_file(**tool_args)
+    elif tool_name == "git_status":
+        return await _tool_git_status(**tool_args)
+    elif tool_name == "git_commit":
+        return await _tool_git_commit(**tool_args)
     else:
         return f"Unknown tool: {tool_name}"
 

@@ -34,6 +34,8 @@ services:
       - ./SOUL.md:/app/SOUL.md:ro
       - ./static:/app/static:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /home/miko_node_001/awaas/workspace:/workspace:rw
+      - /home/miko_node_001/awaas:/awaas:ro
       - /usr/bin/docker:/usr/bin/docker:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8400/health')"]
