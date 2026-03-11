@@ -15,7 +15,6 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from integrations.ollama_client import MODEL_PRIMARY
-from integrations.claude_client import draft_json as claude_draft_json, ClaudeError
 from main import app_state
 from models.payloads import AnalyzePayload, AnalyzeResult
 
@@ -139,29 +138,19 @@ Document text:
 Analyze this document."""
 
     try:
-        try:
-            response_text = await claude_draft_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                task="draft",
-                max_tokens=4096,
-                temperature=0.1,
-            )
-            logger.info("Document analysis via Claude API")
-        except ClaudeError as claude_err:
-            logger.warning("Claude unavailable (%s) — falling back to local", claude_err)
-            ollama = app_state["ollama"]
-            response_text = await ollama.chat_json(
-                prompt=user_prompt,
-                model=MODEL_PRIMARY,
-                system=system_prompt,
-                temperature=0.1,
-                timeout=180.0,
-            )
+        ollama = app_state["ollama"]
+        response = await ollama.chat_json(
+            prompt=user_prompt,
+            model=MODEL_PRIMARY,
+            system=system_prompt,
+            temperature=0.2,
+            timeout=300.0,
+        )
+        logger.info("Document analyzed via local inference doc_id=%s", payload.case_id)
 
         # Calculate timing and token usage (estimate)
         processing_time_ms = int((time.time() - start_time) * 1000)
-        tokens_used = len(payload.document_text.split()) + len(str(response_text).split())
+        tokens_used = len(payload.document_text.split()) + len(str(response).split())
 
         logger.info(
             "Analysis complete doc_id=%s processing_time_ms=%d",
@@ -170,7 +159,7 @@ Analyze this document."""
         )
 
         return AnalyzeResult(
-            result=response_text,
+            result=response,
             processing_time_ms=processing_time_ms,
             tokens_used=tokens_used,
         )

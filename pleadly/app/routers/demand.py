@@ -16,7 +16,6 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from integrations.ollama_client import MODEL_PRIMARY
-from integrations.claude_client import draft_json as claude_draft_json, ClaudeError
 from main import app_state
 from models.payloads import DemandPayload, DemandResult
 
@@ -162,27 +161,15 @@ SPECIAL INSTRUCTIONS:
 Generate a complete, attorney-ready demand letter."""
 
     try:
-        # Prefer Claude for legal drafting quality — fallback to local if unavailable
-        try:
-            response = await claude_draft_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                task="demand",
-                demand_amount=payload.demand_amount,
-                max_tokens=4096,
-                temperature=0.2,
-            )
-            logger.info("Demand letter drafted via Claude API case_id=%s", payload.case_id)
-        except ClaudeError as claude_err:
-            logger.warning("Claude unavailable (%s) — falling back to local model", claude_err)
-            ollama = app_state["ollama"]
-            response = await ollama.chat_json(
-                prompt=user_prompt,
-                model=MODEL_PRIMARY,
-                system=system_prompt,
-                temperature=0.2,
-                timeout=300.0,
-            )
+        ollama = app_state["ollama"]
+        response = await ollama.chat_json(
+            prompt=user_prompt,
+            model=MODEL_PRIMARY,
+            system=system_prompt,
+            temperature=0.2,
+            timeout=300.0,
+        )
+        logger.info("Demand letter drafted via local inference case_id=%s", payload.case_id)
 
         # Calculate processing time and token usage
         processing_time_ms = int((time.time() - start_time) * 1000)
