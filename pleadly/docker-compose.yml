@@ -77,6 +77,8 @@ services:
     working_dir: /app
     volumes:
       - ./app:/app:ro
+      - /mnt/data/hf_cache:/mnt/data/hf_cache
+      - /mnt/data/torch_cache:/mnt/data/torch_cache
     environment:
       - OLLAMA_URL=http://172.23.0.1:11435
       - REDIS_URL=redis://redis:6379
@@ -84,7 +86,11 @@ services:
       - QDRANT_URL=http://pleadly-qdrant:6333
       - QDRANT_API_KEY=${PLEADLY_QDRANT_API_KEY}
       - PLEADLY_HMAC_SECRET=${PLEADLY_HMAC_SECRET}
+      - PLEADLY_CALLBACK_URL=https://www.pleadly.ai
       - DATA_CLASS=PRIVILEGED
+      - HF_HOME=/mnt/data/hf_cache
+      - TORCHINDUCTOR_CACHE_DIR=/mnt/data/torch_cache
+      - HOME=/tmp
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - MASTER_POSTGRES_DSN=${MASTER_POSTGRES_DSN}
     networks:
