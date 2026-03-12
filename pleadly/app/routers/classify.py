@@ -16,6 +16,8 @@ from fastapi import APIRouter, HTTPException
 from integrations.ollama_client import MODEL_CLASSIFIER
 from main import app_state
 from models.payloads import ClassifyPayload, ClassifyResult
+from utils.pdf import extract_text_from_base64_pdf as _extract_pdf_sync
+from utils.vision_ocr import extract_text_from_base64_document
 
 logger = logging.getLogger("pleadly.classify")
 
@@ -42,8 +44,16 @@ async def classify_document(payload: ClassifyPayload) -> ClassifyResult:
         payload.organization_id,
     )
 
-    # Truncate document text to first 2000 chars for classification
-    text_sample = payload.document_text[:2000]
+    # Use base64 PDF if provided, otherwise fall back to document_text
+    if payload.document_base64:
+        _extraction = await extract_text_from_base64_document(
+            payload.document_base64,
+            payload.file_name or "document.pdf",
+        )
+        document_text = _extraction["text"]
+    else:
+        document_text = payload.document_text
+    text_sample = document_text[:2000]
 
     # Build classification prompt
     system_prompt = """You are a legal document classifier. Your task is to classify documents into one of these types:
@@ -94,9 +104,14 @@ Classify this document."""
             confidence,
         )
 
+        extraction_meta = _extraction if payload.document_base64 else {}
         return ClassifyResult(
             document_type=document_type,
             confidence=confidence,
+            extraction_confidence=_extraction.get("confidence", 1.0) if payload.document_base64 else 1.0,
+            handwriting_detected=_extraction.get("handwriting_detected", False) if payload.document_base64 else False,
+            extraction_warnings=_extraction.get("warnings", []) if payload.document_base64 else [],
+            needs_review=_extraction.get("needs_review", False) if payload.document_base64 else False,
             result={
                 "documentType": document_type,
                 "confidence": confidence,
