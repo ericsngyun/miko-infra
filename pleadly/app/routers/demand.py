@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+import uuid
 
 from fastapi import APIRouter, HTTPException
 
@@ -22,6 +24,95 @@ from models.payloads import DemandPayload, DemandResult
 logger = logging.getLogger("pleadly.demand")
 
 router = APIRouter()
+
+# Master postgres DSN for workflow tracking
+MASTER_DSN = os.getenv("MASTER_POSTGRES_DSN", "")
+
+
+async def _track_workflow_start(org_id: str | None, case_id: str) -> str | None:
+    """
+    Write workflow_runs row at start of demand generation.
+    Returns workflow run_id on success, None on failure.
+    Non-blocking: logs error but never raises.
+    """
+    if not MASTER_DSN:
+        logger.warning("MASTER_POSTGRES_DSN not set, skipping workflow tracking")
+        return None
+    
+    run_id = str(uuid.uuid4())
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(MASTER_DSN, timeout=5)
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """INSERT INTO workflow_runs
+                       (id, run_type, status, agent_id, org_id, model_used, metadata)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                    run_id, "demand_draft", "running", "pleadly-api",
+                    org_id, "qwen3.5-35b", json.dumps({"case_id": case_id})
+                )
+            return run_id
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.error("Failed to track workflow start: %s", exc)
+        return None
+
+
+async def _track_workflow_complete(
+    run_id: str | None,
+    duration_ms: int,
+    token_count: int,
+    output_summary: str,
+) -> None:
+    """
+    Update workflow_runs row on successful completion.
+    Non-blocking: logs error but never raises.
+    """
+    if not run_id or not MASTER_DSN:
+        return
+    
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(MASTER_DSN, timeout=5)
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """UPDATE workflow_runs
+                       SET status = $1, duration_ms = $2, token_count = $3, output_summary = $4
+                       WHERE id = $5""",
+                    "completed", duration_ms, token_count, output_summary[:200], run_id
+                )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.error("Failed to track workflow completion: %s", exc)
+
+
+async def _track_workflow_failed(run_id: str | None, error_msg: str) -> None:
+    """
+    Update workflow_runs row on failure.
+    Non-blocking: logs error but never raises.
+    """
+    if not run_id or not MASTER_DSN:
+        return
+    
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(MASTER_DSN, timeout=5)
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """UPDATE workflow_runs
+                       SET status = $1, error = $2
+                       WHERE id = $3""",
+                    "failed", error_msg[:500], run_id
+                )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.error("Failed to track workflow failure: %s", exc)
 
 
 @router.post("/demand", response_model=DemandResult)
@@ -48,6 +139,9 @@ async def generate_demand(payload: DemandPayload) -> DemandResult:
         payload.case_id,
         payload.organization_id,
     )
+
+    # Track workflow start (non-blocking)
+    run_id = await _track_workflow_start(payload.organization_id, payload.case_id)
 
     # Build context for demand letter
     jurisdiction = payload.firm_context.jurisdiction or "California"
@@ -98,46 +192,37 @@ Create a professional demand letter with these sections:
        Copy verbatim from MEDICAL SUMMARY physical_exam_findings — do not summarize or omit.
    3d. Diagnostic imaging: list each study and its findings verbatim from MEDICAL SUMMARY.
    3e. Treatment administered: list each CPT with description from MEDICAL SUMMARY treatments_administered.
-   3f. Discharge: medications prescribed, follow-up ordered, referrals placed from MEDICAL SUMMARY.
-   3g. Prognosis: copy verbatim from MEDICAL SUMMARY prognosis field.
+   3f. Prognosis: copy verbatim from MEDICAL SUMMARY prognosis or clinical_impression. Do not editorialize.
+   3g. Causation statement: explicitly link injuries to this accident. Use the exact phrases from MEDICAL SUMMARY.
 
 4. SPECIAL DAMAGES
-   - One introductory sentence identifying the provider and statement.
-   - ONE table only with columns: CPT Code | Service Description | Amount.
-     Use ONLY the line items from BILLING SUMMARY — do not add any rows.
-   - One line: "Total Special Damages: $[exact total_billed from BILLING SUMMARY]"
-   - Do NOT include a second subtotal table or any duplicate billing section.
-   - State the lien notice from BILLING SUMMARY if present.
+   - Past medical expenses: use the EXACT dollar amount from the pre-calculated TOTAL BILLED in BILLING SUMMARY.
+   - Do not calculate or estimate — copy the pre-calculated figure verbatim.
+   - Vehicle damage: use the estimate from POLICE REPORT DATA.
+   - Lost wages (if in case summary): use verbatim from case summary.
+   - Write one paragraph summarizing special damages with the final total.
 
 5. GENERAL DAMAGES
-   - Lead with the neurological findings (C6 radiculopathy, dermatomal loss, grip strength deficit).
-   - Address functional limitations, emotional distress, loss of enjoyment of life.
-   - Reference the pending MRI and risk of permanent injury.
+   - Pain and suffering: use the pre-calculated general damages amount.
+   - Do not recalculate — copy the pre-calculated figure verbatim from CASE SUMMARY or system instructions.
+   - Describe impact on daily life from CASE SUMMARY.
 
 6. SETTLEMENT DEMAND
-   - State: Total Special Damages = [exact total_billed]
-   - State: General Damages Multiplier = 3.5x — this is MANDATORY. Do not use 3.0x. The C6 radiculopathy with dermatomal sensory loss and grip strength deficit (4/5) requires 3.5x minimum.
-   - State: General Damages = [total_billed x 3.5]
-   - State: Total Demand = [total_billed + general_damages]
-   - Set deadline 30 days from letter date.
-   - ONE closing block only: "Sincerely," then a blank line, then attorney name from FIRM NAME field,
-     then firm name from FIRM NAME field. Do not add a second closing block under any circumstances.
+   - State the pre-calculated total demand amount verbatim.
+   - Do not recalculate — copy the pre-calculated figure from CASE SUMMARY or system instructions.
+   - Include deadline for response (30 days).
+   - Statement that this is a good faith offer.
 
-FORMATTING RULES:
-- The addressee block (insurer name, claim number, insured name) goes at the TOP of the letter
-  before "Dear [Adjuster]:" — it must NOT appear inside section 1 body text.
-- Section 1 body must begin with: "[Firm name] represents [client name]..." — no date, no claim number, no addressee text inside the paragraph.
-- Use "Dear Claims Adjuster:" if no adjuster name is available.
-- Never produce two closing blocks. One "Sincerely," section only, at the very end.
-- Never produce two billing tables. One CPT table in section 4 only.
+Format: business letter with firm letterhead placeholder.
+Tone: professional, fact-based, persuasive but not inflammatory.
 
-Return the letter as JSON with these fields:
+JSON OUTPUT FORMAT:
 {{
-  "letterText": "full letter text in markdown format",
+  "letterText": "full text of letter",
   "sections": {{
-    "introduction": "text",
+    "representationAndPurpose": "text",
     "liability": "text",
-    "injuries": "text",
+    "injuriesAndTreatment": "text",
     "specialDamages": "text",
     "generalDamages": "text",
     "demand": "text"
@@ -259,6 +344,10 @@ Generate a complete, attorney-ready demand letter."""
             "breakdown": response.get("breakdown", {}),
         }
 
+        # Track workflow completion (non-blocking)
+        output_summary = response.get("letterText", "")
+        await _track_workflow_complete(run_id, processing_time_ms, tokens_used, output_summary)
+
         metadata = {
             "caseId": payload.case_id,
             "caseName": case_name,
@@ -278,12 +367,16 @@ Generate a complete, attorney-ready demand letter."""
 
     except json.JSONDecodeError as exc:
         logger.error("Failed to parse Ollama JSON response: %s", exc)
+        # Track workflow failure (non-blocking)
+        await _track_workflow_failed(run_id, f"JSON parse error: {str(exc)}")
         raise HTTPException(
             status_code=500,
             detail="Demand generation failed: invalid model response",
         )
     except Exception as exc:
         logger.error("Demand generation failed: %s", exc)
+        # Track workflow failure (non-blocking)
+        await _track_workflow_failed(run_id, str(exc))
         raise HTTPException(
             status_code=500,
             detail=f"Demand generation failed: {str(exc)}",
