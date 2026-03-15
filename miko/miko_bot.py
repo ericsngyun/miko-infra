@@ -1323,6 +1323,69 @@ async def get_infrastructure_state() -> str:
         logger.warning("Infrastructure state query failed: %s", e)
         return f"Could not reach infrastructure state database: {e}"
 
+
+async def get_workflow_runs_summary() -> str:
+    """Query workflow_runs table for last 24hr inference activity."""
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        return "Workflow tracking unavailable — no postgres connection configured."
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+        rows = await conn.fetch("""
+            WITH last_24h AS (
+                SELECT * FROM workflow_runs
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+            )
+            SELECT
+                run_type,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                ROUND(AVG(CASE WHEN status = 'completed' AND duration_ms IS NOT NULL
+                          THEN duration_ms ELSE NULL END)::numeric, 0) as avg_duration_ms
+            FROM last_24h
+            GROUP BY run_type
+            ORDER BY total DESC
+        """)
+
+        failed_runs = await conn.fetch("""
+            SELECT run_type, error, created_at
+            FROM workflow_runs
+            WHERE status = 'failed'
+              AND created_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY created_at DESC
+            LIMIT 5
+        """)
+        await conn.close()
+
+        if not rows:
+            return "📊 Inference Activity (last 24hrs): No runs recorded yet"
+
+        lines = ["📊 Inference Activity (last 24hrs):"]
+        total_runs = sum(r["total"] for r in rows)
+        total_completed = sum(r["completed"] for r in rows)
+
+        for r in rows:
+            pct = int(100 * r["completed"] / r["total"]) if r["total"] > 0 else 0
+            avg_dur = f"{int(r['avg_duration_ms'])}ms" if r["avg_duration_ms"] else "N/A"
+            lines.append(
+                f"  • {r['run_type']}: {r['total']} runs, {pct}% success, avg {avg_dur}"
+            )
+
+        overall_pct = int(100 * total_completed / total_runs) if total_runs > 0 else 0
+        lines.append(f"\nOverall: {total_runs} runs, {overall_pct}% success rate")
+
+        if failed_runs:
+            lines.append("\n⚠️ Recent failures:")
+            for f in failed_runs:
+                age_str = f["created_at"].strftime("%H:%M")
+                error_short = (f["error"] or "unknown")[:60]
+                lines.append(f"  • {f['run_type']} at {age_str}: {error_short}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning("Workflow runs query failed: %s", e)
+        return f"Could not query workflow_runs: {e}"
+
 # ---------------------------------------------------------------------------
 # Mem0 memory layer
 # ---------------------------------------------------------------------------
@@ -1928,6 +1991,32 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(reply)
 
 
+async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/brief — morning intelligence brief with infrastructure + inference activity."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Gather all status data
+    status = await get_pleadly_status()
+    status_str = format_pleadly_status(status)
+    infra_state = await get_infrastructure_state()
+    workflow_summary = await get_workflow_runs_summary()
+
+    # Assemble brief
+    now = datetime.now(timezone.utc)
+    brief_header = f"📋 Morning Brief — {now.strftime('%Y-%m-%d %H:%M UTC')}\n"
+
+    sections = [
+        brief_header,
+        "=" * 40,
+        status_str,
+        "\n" + infra_state,
+        "\n" + workflow_summary,
+    ]
+
+    brief = "\n".join(sections)
+    await update.message.reply_text(brief)
+
+
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/memory — show what Miko remembers about this user."""
     chat_id = update.effective_chat.id
@@ -1944,6 +2033,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — command list."""
     text = (
         "Commands:\n"
+        "/brief — morning intelligence brief (infra + inference activity)\n"
         "/status — live Pleadly pipeline status\n"
         "/memory — what I remember about you\n"
         "/help — this list\n\n"
@@ -1956,6 +2046,7 @@ def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
