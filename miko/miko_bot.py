@@ -1425,6 +1425,200 @@ async def get_workflow_runs_summary() -> str:
         return f"Could not query workflow_runs: {e}"
 
 # ---------------------------------------------------------------------------
+# Approval queue polling and handlers
+# ---------------------------------------------------------------------------
+
+# Track notified approval IDs to avoid spam
+_notified_approvals: set[str] = set()
+
+async def approval_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Poll approval_queue every 60s for pending approvals.
+    - Send Telegram notification for approvals approaching timeout (< 30 min remaining)
+    - Auto-expire approvals past timeout_at
+    """
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        return
+
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+
+        # Find pending approvals approaching timeout (< 30 min remaining)
+        approaching = await conn.fetch("""
+            SELECT id, agent, action_type, payload_summary, timeout_at, created_at
+            FROM approval_queue
+            WHERE status = 'pending'
+              AND timeout_at < NOW() + INTERVAL '30 minutes'
+              AND timeout_at > NOW()
+            ORDER BY timeout_at ASC
+        """)
+
+        # Send notifications for approvals we haven't notified yet
+        for row in approaching:
+            approval_id = str(row["id"])
+            if approval_id not in _notified_approvals:
+                expires_in = (row["timeout_at"] - datetime.now(timezone.utc)).total_seconds() / 60
+                expires_str = row["timeout_at"].strftime("%H:%M UTC")
+
+                message = (
+                    f"⏳ *Approval needed* [{row['action_type']}]\n"
+                    f"Agent: `{row['agent']}`\n"
+                    f"Summary: {row['payload_summary']}\n"
+                    f"Expires: {expires_str} ({int(expires_in)}m remaining)\n\n"
+                    f"Reply `/approve {approval_id}` or `/reject {approval_id}`"
+                )
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=ERIC_CHAT_ID,
+                        text=message,
+                        parse_mode="Markdown"
+                    )
+                    _notified_approvals.add(approval_id)
+                    logger.info("Sent approval notification for %s", approval_id)
+                except Exception as e:
+                    logger.warning("Failed to send approval notification: %s", e)
+
+        # Auto-expire approvals past timeout_at
+        expired = await conn.execute("""
+            UPDATE approval_queue
+            SET status = 'expired',
+                decided_at = NOW(),
+                decided_by = 'system'
+            WHERE status = 'pending'
+              AND timeout_at < NOW()
+            RETURNING id
+        """)
+
+        if expired:
+            # Remove from notified set
+            expired_rows = await conn.fetch("""
+                SELECT id FROM approval_queue
+                WHERE status = 'expired'
+                  AND decided_at > NOW() - INTERVAL '5 minutes'
+            """)
+            for row in expired_rows:
+                approval_id = str(row["id"])
+                _notified_approvals.discard(approval_id)
+
+            logger.info("Auto-expired %s approval(s)", expired.split()[1] if ' ' in expired else '0')
+
+        await conn.close()
+
+    except Exception as e:
+        logger.warning("Approval check job failed: %s", e)
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/approve <id> — approve a pending request from approval_queue."""
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /approve <approval_id>")
+        return
+
+    approval_id = context.args[0]
+
+    # Basic UUID format validation
+    if len(approval_id) != 36 or approval_id.count('-') != 4:
+        await update.message.reply_text("❌ Invalid approval ID format")
+        return
+
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        await update.message.reply_text("❌ Database unavailable")
+        return
+
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+
+        # Update status to approved
+        result = await conn.fetchrow("""
+            UPDATE approval_queue
+            SET status = 'approved',
+                decided_by = 'eric',
+                decided_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING agent, action_type, payload_summary
+        """, approval_id)
+
+        await conn.close()
+
+        if result:
+            # Remove from notified set
+            _notified_approvals.discard(approval_id)
+
+            await update.message.reply_text(
+                f"✅ *Approved*\n"
+                f"ID: `{approval_id}`\n"
+                f"Agent: {result['agent']}\n"
+                f"Action: {result['action_type']}",
+                parse_mode="Markdown"
+            )
+            logger.info("Approval %s approved by eric", approval_id)
+        else:
+            await update.message.reply_text(
+                f"❌ Approval `{approval_id}` not found or already processed",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error("Approve command failed: %s", e)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reject <id> — reject a pending request from approval_queue."""
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /reject <approval_id>")
+        return
+
+    approval_id = context.args[0]
+
+    # Basic UUID format validation
+    if len(approval_id) != 36 or approval_id.count('-') != 4:
+        await update.message.reply_text("❌ Invalid approval ID format")
+        return
+
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        await update.message.reply_text("❌ Database unavailable")
+        return
+
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+
+        # Update status to rejected
+        result = await conn.fetchrow("""
+            UPDATE approval_queue
+            SET status = 'rejected',
+                decided_by = 'eric',
+                decided_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING agent, action_type, payload_summary
+        """, approval_id)
+
+        await conn.close()
+
+        if result:
+            # Remove from notified set
+            _notified_approvals.discard(approval_id)
+
+            await update.message.reply_text(
+                f"❌ *Rejected*\n"
+                f"ID: `{approval_id}`\n"
+                f"Agent: {result['agent']}\n"
+                f"Action: {result['action_type']}",
+                parse_mode="Markdown"
+            )
+            logger.info("Approval %s rejected by eric", approval_id)
+        else:
+            await update.message.reply_text(
+                f"❌ Approval `{approval_id}` not found or already processed",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error("Reject command failed: %s", e)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+# ---------------------------------------------------------------------------
 # Mem0 memory layer
 # ---------------------------------------------------------------------------
 
@@ -2074,6 +2268,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/brief — morning intelligence brief (infra + inference activity)\n"
         "/status — live Pleadly pipeline status\n"
         "/memory — what I remember about you\n"
+        "/approve <id> — approve pending agent action\n"
+        "/reject <id> — reject pending agent action\n"
         "/help — this list\n\n"
         "Or just talk to me. I'm here."
     )
@@ -2087,6 +2283,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     set_tg_bot(app.bot)
@@ -2181,10 +2379,32 @@ async def main():
         await tg_app.start()
         await tg_app.updater.start_polling(drop_pending_updates=True)
         logger.info("Miko Telegram bot started")
+
+        # Start approval polling background task
+        async def _approval_polling_loop():
+            """Background task that polls for approvals every 60s."""
+            await asyncio.sleep(10)  # Initial delay
+            while True:
+                try:
+                    # Pass a mock context with just the bot
+                    class MockContext:
+                        def __init__(self, bot):
+                            self.bot = bot
+                    await approval_check_job(MockContext(tg_app.bot))
+                except Exception as e:
+                    logger.error("Approval polling failed: %s", e)
+                await asyncio.sleep(60)
+
+        approval_task = asyncio.create_task(_approval_polling_loop())
+        logger.info("Approval polling task started (60s interval)")
+
         logger.info("Miko web backend starting on :8400")
-        await server.serve()
-        await tg_app.updater.stop()
-        await tg_app.stop()
+        try:
+            await server.serve()
+        finally:
+            approval_task.cancel()
+            await tg_app.updater.stop()
+            await tg_app.stop()
 
 
 if __name__ == "__main__":
