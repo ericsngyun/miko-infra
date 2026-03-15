@@ -88,6 +88,15 @@ async def health_poll_job() -> None:
 
     _previously_down = down
 
+    # Write master-conductor's own status (if we're running, we're up)
+    await upsert_infrastructure_state(
+        service="master-conductor",
+        project_name=None,
+        status="up",
+        response_ms=None,
+        detail={"poll_count": len(results), "down_count": len(down)},
+    )
+
     if not down:
         logger.info("Health poll complete — all %d services up", len(results))
     else:
