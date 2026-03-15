@@ -84,6 +84,44 @@ MASTER_POSTGRES_DSN = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
+# Model router — policy-based endpoint selection
+# ---------------------------------------------------------------------------
+MODEL_POLICY = {
+    "endpoints": {
+        "reasoning": {
+            "url": "http://172.23.0.1:11435",
+            "model": "Qwen3.5-35B",
+            "description": "Main reasoning model - demand drafts, planning, complex tasks"
+        },
+        "fast": {
+            "url": "http://172.23.0.1:11437",
+            "model": "Qwen3.5-4B",
+            "description": "Fast inference - classification, routing decisions, simple tasks"
+        },
+        "embedding": {
+            "url": "http://172.23.0.1:11436",
+            "model": "nomic-embed-text",
+            "description": "Embeddings only - vector generation for RAG"
+        }
+    },
+    "task_mappings": {
+        "reasoning": "reasoning",
+        "demand": "reasoning",
+        "planning": "reasoning",
+        "fast": "fast",
+        "classification": "fast",
+        "routing": "fast",
+        "embedding": "embedding"
+    },
+    "default": "reasoning"
+}
+
+def get_endpoint(task_type: str) -> str:
+    """Get endpoint URL for task type based on policy."""
+    endpoint_name = MODEL_POLICY["task_mappings"].get(task_type, MODEL_POLICY["default"])
+    return MODEL_POLICY["endpoints"][endpoint_name]["url"]
+
+# ---------------------------------------------------------------------------
 # Permission system
 # ---------------------------------------------------------------------------
 # Tier: "green" = auto, "yellow" = ask + 2min auto-approve, "red" = always ask
@@ -622,7 +660,7 @@ async def _tool_web_fetch(url: str, summary: bool = False) -> str:
             # Use local 35B to summarize
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(
-                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                    f"{get_endpoint('reasoning')}/v1/chat/completions",
                     json={
                         "model": MODEL,
                         "messages": [
@@ -800,7 +838,7 @@ Return ONLY the queries, one per line, no numbering, no explanation.
 Goal: {goal}"""
             async with httpx.AsyncClient(timeout=30.0) as _dc:
                 _dr = await _dc.post(
-                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                    f"{get_endpoint('reasoning')}/v1/chat/completions",
                     json={
                         "model": MODEL,
                         "messages": [{"role": "user", "content": decompose_prompt}],
@@ -874,7 +912,7 @@ Be direct, factual, and cut anything that isn't immediately useful."""
 
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     r = await client.post(
-                        f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                        f"{get_endpoint('reasoning')}/v1/chat/completions",
                         json={
                             "model": MODEL,
                             "messages": [
@@ -1057,7 +1095,7 @@ async def _resume_after_approval(
 
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                f"{get_endpoint('reasoning')}/v1/chat/completions",
                 json={
                     "model": MODEL,
                     "messages": final_messages,
@@ -1268,11 +1306,11 @@ def route_model(message: str) -> tuple[str, str]:
     msg = message.lower().strip()
     for pattern in _DEEP_PATTERNS:
         if _re.search(pattern, msg, _re.IGNORECASE):
-            return MODEL, LLAMA_SERVER_URL
+            return MODEL, get_endpoint('reasoning')
     for pattern in _FAST_PATTERNS:
         if _re.search(pattern, msg, _re.IGNORECASE):
-            return FAST_MODEL, FAST_SERVER_URL
-    return MODEL, LLAMA_SERVER_URL
+            return FAST_MODEL, get_endpoint('fast')
+    return MODEL, get_endpoint('reasoning')
 
 # ---------------------------------------------------------------------------
 # Infrastructure state query — reads from master-postgres
@@ -1417,7 +1455,7 @@ try:
             "provider": "openai",
             "config": {
                 "model": MODEL,
-                "openai_base_url": f"{LLAMA_SERVER_URL}/v1",
+                "openai_base_url": f"{get_endpoint('reasoning')}/v1",
                 "api_key": "not-needed",
                 "temperature": 0.1,
                 "max_tokens": 2000,
@@ -1427,7 +1465,7 @@ try:
             "provider": "openai",
             "config": {
                 "model": "nomic-embed-text",
-                "openai_base_url": f"{EMBED_SERVER_URL}/v1",
+                "openai_base_url": f"{get_endpoint('embedding')}/v1",
                 "api_key": "not-needed",
                 "embedding_dims": 768,
             },
@@ -1467,7 +1505,7 @@ async def remember_fact(user_id: str, fact: str) -> bool:
         # Get embedding for the fact
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{EMBED_SERVER_URL}/v1/embeddings",
+                f"{get_endpoint('embedding')}/v1/embeddings",
                 json={"model": EMBED_MODEL, "input": fact}
             )
             resp.raise_for_status()
@@ -1606,7 +1644,7 @@ Answer in JSON only, no other text:
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
             r = await c.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                f"{get_endpoint('reasoning')}/v1/chat/completions",
                 json={
                     "model": MODEL,
                     "messages": [{"role": "user", "content": prompt}],
@@ -1658,7 +1696,7 @@ Answer in JSON only:
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
             r = await c.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                f"{get_endpoint('reasoning')}/v1/chat/completions",
                 json={
                     "model": MODEL,
                     "messages": [{"role": "user", "content": prompt}],
@@ -1736,7 +1774,7 @@ After the tool result is returned, synthesize a natural response. Never fabricat
 
     # Always use deep model for tool-capable calls
     selected_model = MODEL
-    selected_server = LLAMA_SERVER_URL
+    selected_server = get_endpoint('reasoning')
     logger.info("Agent call: model=%s", selected_model[:30])
     # Keep typing indicator alive during inference
     _typing_chat_id = ERIC_CHAT_ID if user_id == "eric" else DAVID_CHAT_ID
