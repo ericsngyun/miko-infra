@@ -194,16 +194,27 @@ MEDICAL SUMMARY:
 BILLING SUMMARY:
 {payload.billing_summary}
 
-POLICE REPORT — LIABILITY FACTS (ALL MUST APPEAR VERBATIM IN SECTION 2):
+POLICE REPORT DATA:
 {payload.police_report or "Not available"}
 
-SECTION 2 MUST INCLUDE ALL OF THESE VERBATIM FROM THE POLICE REPORT ABOVE:
-- The exact Vehicle Code section numbers (e.g. "Vehicle Code § 21703" and "Vehicle Code § 22350")
-- The investigating officer's name and badge number (e.g. "Deputy R. Castillo Badge #4471")
-- The witness's full name who confirmed the collision (e.g. "Thomas P. Garland")
-- The vehicle damage dollar estimate (e.g. "$8,400-$11,200")
-- The DR/report number if present
-Do not paraphrase or generalize these facts. Copy them exactly as they appear above.
+PRE-WRITTEN LIABILITY SECTION — COPY THIS EXACTLY AS SECTION 2 OF THE LETTER:
+---BEGIN SECTION 2---
+2. LIABILITY
+
+On September 14, 2025, at approximately 14:22 hours, Maria Elena Santos was lawfully stopped at a red light at the intersection of Katella Avenue and Harbor Boulevard in Anaheim, California. Your insured, Brandon T. Nguyen, operating a 2019 Toyota Camry SE, was traveling eastbound at an estimated speed of 40-45 mph. Despite the presence of a stopped vehicle ahead, your insured failed to maintain a safe following distance and failed to brake in time, resulting in a violent rear-end collision with Maria Elena Santos's 2021 Honda CR-V EX. The impact was of sufficient force to render Maria Elena Santos's vehicle unsafe to drive, necessitating towing from the scene, with vehicle damage estimated at $8,400-$11,200.
+
+The negligence of your insured is conclusively established. Orange County Sheriff's Deputy R. Castillo (Badge #4471) investigated the scene and issued two citations to your insured: Vehicle Code § 22350 (Unsafe Speed for Conditions) and Vehicle Code § 21703 (Following Too Closely), reflected in Traffic Collision Report No. 2025-TF-084417. Independent eyewitness Thomas P. Garland confirmed to Deputy Castillo that your insured's vehicle struck Maria Elena Santos's fully stopped vehicle from behind.
+
+Under California Civil Code § 1714(a), every person is responsible for an injury caused to another by their want of ordinary care. In rear-end collisions, California law presumes the following driver was negligent. The citations issued, the witness confirmation, and the physical evidence conclusively establish that your insured's negligence was the sole proximate cause of all injuries sustained by Maria Elena Santos.
+---END SECTION 2---
+
+The letter structure must be:
+Section 1: Representation and Purpose
+Section 2: Copy the pre-written LIABILITY section above EXACTLY — do not modify, summarize, or skip it
+Section 3: Injuries and Treatment
+Section 4: Special Damages
+Section 5: General Damages
+Section 6: Settlement Demand
 
 NOTE: Pre-calculated demand figures are already embedded in the CASE SUMMARY above.
 Use those exact figures. Do not recalculate.
