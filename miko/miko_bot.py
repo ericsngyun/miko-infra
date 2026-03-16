@@ -39,7 +39,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -146,8 +146,6 @@ TOOL_PERMISSION_TIER: dict[str, str] = {
 _pending_approvals: dict[str, dict] = {}
 
 # request_permission removed — replaced by non-blocking execute_tool
-
-
 async def handle_approval_callback(update, context) -> None:
     """Handle ✅/❌ button presses — execute tool immediately on approval."""
     query = update.callback_query
@@ -234,6 +232,78 @@ async def handle_approval_callback(update, context) -> None:
             text=f"Tool {tool_name} failed: {str(e)[:300]}",
         )
 
+async def handle_approval_queue_callback(update, context) -> None:
+    """Handle ✅/❌ button presses for approval_queue requests."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    # Format: aq:approve:{approval_id} or aq:reject:{approval_id}
+    if not data.startswith("aq:"):
+        return
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+
+    _, action, approval_id = parts
+
+    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
+        await query.edit_message_text("❌ Database unavailable")
+        return
+
+    try:
+        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
+
+        if action == "approve":
+            result = await conn.fetchrow("""
+                UPDATE approval_queue
+                SET status = 'approved',
+                    decided_by = 'eric',
+                    decided_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING agent, action_type, payload_summary
+            """, approval_id)
+
+            if result:
+                _notified_approvals.discard(approval_id)
+                await query.edit_message_text(
+                    f"✅ *Approved*\n"
+                    f"Agent: {result['agent']}\n"
+                    f"Action: {result['action_type']}\n"
+                    f"Summary: {result['payload_summary'][:200]}"
+                )
+                logger.info("Approval %s approved by eric via button", approval_id)
+            else:
+                await query.edit_message_text("⚠️ This request has already been handled or expired.")
+
+        elif action == "reject":
+            result = await conn.fetchrow("""
+                UPDATE approval_queue
+                SET status = 'rejected',
+                    decided_by = 'eric',
+                    decided_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING agent, action_type, payload_summary
+            """, approval_id)
+
+            if result:
+                _notified_approvals.discard(approval_id)
+                await query.edit_message_text(
+                    f"❌ *Rejected*\n"
+                    f"Agent: {result['agent']}\n"
+                    f"Action: {result['action_type']}\n"
+                    f"Summary: {result['payload_summary'][:200]}"
+                )
+                logger.info("Approval %s rejected by eric via button", approval_id)
+            else:
+                await query.edit_message_text("⚠️ This request has already been handled or expired.")
+
+        await conn.close()
+
+    except Exception as e:
+        logger.error("Approval queue callback failed: %s", e)
+        await query.edit_message_text(f"❌ Error: {str(e)}")
 def get_session_history(user_id: str) -> deque:
     if user_id not in _session_history:
         _session_history[user_id] = deque(maxlen=20)
@@ -474,8 +544,6 @@ async def _tool_task_add(title: str, owner: str, priority: int, due_date: str | 
         return f"✅ Task #{row['id']} created: '{title}' [{owner}] priority {priority}"
     except Exception as e:
         return f"Error creating task: {e}"
-
-
 async def _tool_task_update(id: int, status: str) -> str:
     if not ASYNCPG_AVAILABLE:
         return "Error: asyncpg not available"
@@ -491,8 +559,6 @@ async def _tool_task_update(id: int, status: str) -> str:
         return f"No task found with id={id}"
     except Exception as e:
         return f"Error updating task: {e}"
-
-
 async def _tool_task_list(owner: str) -> str:
     if not ASYNCPG_AVAILABLE:
         return "Error: asyncpg not available"
@@ -518,13 +584,9 @@ async def _tool_task_list(owner: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error listing tasks: {e}"
-
-
 async def _tool_remember(user_id: str, fact: str) -> str:
     success = await remember_fact(user_id=user_id, fact=fact)
     return f"✅ Remembered: {fact}" if success else "⚠️ Failed to write to memory"
-
-
 async def _tool_infra_query(service: str) -> str:
     try:
         conn = await _asyncpg.connect(dsn=MASTER_POSTGRES_DSN)
@@ -548,8 +610,6 @@ async def _tool_infra_query(service: str) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"Error querying infra: {e}"
-
-
 SHELL_ALLOWED_PREFIXES = [
     "docker ps", "docker logs", "docker stats",
     "df ", "df\n", "free ", "free\n",
@@ -571,8 +631,6 @@ def _shell_allowed(command: str) -> bool:
         if cmd.startswith(prefix.lower()):
             return True
     return False
-
-
 async def _tool_shell_exec(command: str) -> str:
     if not _shell_allowed(command):
         return f"⛔ Command not permitted: `{command}`. Allowed: docker ps/logs, df, free, systemctl status, cat logs."
@@ -587,8 +645,6 @@ async def _tool_shell_exec(command: str) -> str:
         return "⚠️ Command timed out (10s limit)"
     except Exception as e:
         return f"Error: {e}"
-
-
 # ---------------------------------------------------------------------------
 # Web + AI tool implementations
 # ---------------------------------------------------------------------------
@@ -602,8 +658,6 @@ def _safe_tg(text: str, max_len: int = 4000) -> str:
         .replace("[", "(")
         .replace("]", ")")
     )[:max_len]
-
-
 async def _send_typing(chat_id: int, duration: float = 0):
     """Send typing action. If duration > 0, keep sending every 4s for that many seconds."""
     if not _tg_bot:
@@ -677,8 +731,6 @@ async def _tool_web_fetch(url: str, summary: bool = False) -> str:
 
     except Exception as e:
         return f"web_fetch error: {e}"
-
-
 async def _tool_web_search(query: str, max_results: int = 5) -> str:
     """Search the web via DuckDuckGo HTML (no API key required)."""
     try:
@@ -769,8 +821,6 @@ async def _tool_web_search(query: str, max_results: int = 5) -> str:
 
     except Exception as e:
         return f"web_search error: {e}"
-
-
 async def _tool_claude_query(prompt: str, context: str = "", max_tokens: int = 2000) -> str:
     """Query Claude claude-sonnet-4-20250514 via Anthropic API."""
     if not ANTHROPIC_API_KEY:
@@ -795,8 +845,6 @@ async def _tool_claude_query(prompt: str, context: str = "", max_tokens: int = 2
             return resp.json()["content"][0]["text"]
     except Exception as e:
         return f"claude_query error: {e}"
-
-
 # Active research tasks: task_id → status
 _research_tasks: dict[str, str] = {}
 
@@ -958,8 +1006,6 @@ Be direct, factual, and cut anything that isn't immediately useful."""
 
     asyncio.create_task(_run_research())
     return f"🔬 Research task `{task_id}` started ({depth}, ~{n_sources} sources).\nGoal: {goal}\n\nI\'ll ping you when the brief is ready."
-
-
 # ---------------------------------------------------------------------------
 # L4 — Autonomous Build Agent Tools
 # ---------------------------------------------------------------------------
@@ -987,8 +1033,6 @@ def _safe_read_path(path: str) -> bool:
         "/tmp/",
     ]
     return any(path.startswith(p) for p in allowed_prefixes)
-
-
 async def _tool_read_file(path: str, lines: int = 200) -> str:
     """Read file contents, restricted to safe paths."""
     if not _safe_read_path(path):
@@ -1007,8 +1051,6 @@ async def _tool_read_file(path: str, lines: int = 200) -> str:
         return f"File not found: {path}"
     except Exception as e:
         return f"read_file error: {e}"
-
-
 async def _tool_write_file(path: str, content: str) -> str:
     """Write file, strictly sandboxed to /workspace."""
     if not path.startswith(WORKSPACE_DIR):
@@ -1022,8 +1064,6 @@ async def _tool_write_file(path: str, content: str) -> str:
         return f"Written: {path} ({lines} lines, {len(content)} bytes)"
     except Exception as e:
         return f"write_file error: {e}"
-
-
 async def _tool_git_status(repo: str = "miko-infra") -> str:
     """Run git status + diff --stat in a repo."""
     repo_path = REPO_PATHS.get(repo, REPO_PATHS["miko-infra"])
@@ -1041,8 +1081,6 @@ async def _tool_git_status(repo: str = "miko-infra") -> str:
         return "\n\n".join(result) if result else f"Repo {repo} is clean."
     except Exception as e:
         return f"git_status error: {e}"
-
-
 async def _tool_git_commit(repo: str, message: str) -> str:
     """Stage all and commit. RED tier — only runs after explicit approval."""
     repo_path = REPO_PATHS.get(repo, REPO_PATHS["miko-infra"])
@@ -1067,8 +1105,6 @@ async def _tool_git_commit(repo: str, message: str) -> str:
             return f"Commit failed:\n{commit.stderr.strip()}"
     except Exception as e:
         return f"git_commit error: {e}"
-
-
 async def _resume_after_approval(
     messages: list[dict],
     user_id: str,
@@ -1131,8 +1167,6 @@ async def _resume_after_approval(
     except Exception as e:
         logger.error("_resume_after_approval failed: %s", e)
         return ""
-
-
 async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
     """Execute a tool directly, no permission check."""
     """Execute a tool directly, no permission check."""
@@ -1166,8 +1200,6 @@ async def _dispatch_tool(tool_name: str, tool_args: dict, user_id: str) -> str:
         return await _tool_git_commit(**tool_args)
     else:
         return f"Unknown tool: {tool_name}"
-
-
 async def execute_tool(tool_name: str, tool_args: dict, user_id: str, bot=None) -> str:
     """
     Dispatch tool call with permission gating.
@@ -1360,8 +1392,6 @@ async def get_infrastructure_state() -> str:
     except Exception as e:
         logger.warning("Infrastructure state query failed: %s", e)
         return f"Could not reach infrastructure state database: {e}"
-
-
 async def get_workflow_runs_summary() -> str:
     """Query workflow_runs table for last 24hr inference activity."""
     if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
@@ -1464,15 +1494,25 @@ async def approval_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"⏳ *Approval needed* [{row['action_type']}]\n"
                     f"Agent: `{row['agent']}`\n"
                     f"Summary: {row['payload_summary']}\n"
-                    f"Expires: {expires_str} ({int(expires_in)}m remaining)\n\n"
-                    f"Reply `/approve {approval_id}` or `/reject {approval_id}`"
+                    f"Expires: {expires_str} ({int(expires_in)}m remaining)"
+
                 )
+
+                # Create inline keyboard with Approve/Reject buttons
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Approve", callback_data=f"aq:approve:{approval_id}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"aq:reject:{approval_id}"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
                 try:
                     await context.bot.send_message(
                         chat_id=ERIC_CHAT_ID,
                         text=message,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
+                        reply_markup=reply_markup
                     )
                     _notified_approvals.add(approval_id)
                     logger.info("Sent approval notification for %s", approval_id)
@@ -1507,120 +1547,6 @@ async def approval_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as e:
         logger.warning("Approval check job failed: %s", e)
-
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/approve <id> — approve a pending request from approval_queue."""
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: /approve <approval_id>")
-        return
-
-    approval_id = context.args[0]
-
-    # Basic UUID format validation
-    if len(approval_id) != 36 or approval_id.count('-') != 4:
-        await update.message.reply_text("❌ Invalid approval ID format")
-        return
-
-    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
-        await update.message.reply_text("❌ Database unavailable")
-        return
-
-    try:
-        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
-
-        # Update status to approved
-        result = await conn.fetchrow("""
-            UPDATE approval_queue
-            SET status = 'approved',
-                decided_by = 'eric',
-                decided_at = NOW()
-            WHERE id = $1 AND status = 'pending'
-            RETURNING agent, action_type, payload_summary
-        """, approval_id)
-
-        await conn.close()
-
-        if result:
-            # Remove from notified set
-            _notified_approvals.discard(approval_id)
-
-            await update.message.reply_text(
-                f"✅ *Approved*\n"
-                f"ID: `{approval_id}`\n"
-                f"Agent: {result['agent']}\n"
-                f"Action: {result['action_type']}",
-                parse_mode="Markdown"
-            )
-            logger.info("Approval %s approved by eric", approval_id)
-        else:
-            await update.message.reply_text(
-                f"❌ Approval `{approval_id}` not found or already processed",
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        logger.error("Approve command failed: %s", e)
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-
-async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/reject <id> — reject a pending request from approval_queue."""
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: /reject <approval_id>")
-        return
-
-    approval_id = context.args[0]
-
-    # Basic UUID format validation
-    if len(approval_id) != 36 or approval_id.count('-') != 4:
-        await update.message.reply_text("❌ Invalid approval ID format")
-        return
-
-    if not MASTER_POSTGRES_DSN or not ASYNCPG_AVAILABLE:
-        await update.message.reply_text("❌ Database unavailable")
-        return
-
-    try:
-        conn = await _asyncpg.connect(MASTER_POSTGRES_DSN)
-
-        # Update status to rejected
-        result = await conn.fetchrow("""
-            UPDATE approval_queue
-            SET status = 'rejected',
-                decided_by = 'eric',
-                decided_at = NOW()
-            WHERE id = $1 AND status = 'pending'
-            RETURNING agent, action_type, payload_summary
-        """, approval_id)
-
-        await conn.close()
-
-        if result:
-            # Remove from notified set
-            _notified_approvals.discard(approval_id)
-
-            await update.message.reply_text(
-                f"❌ *Rejected*\n"
-                f"ID: `{approval_id}`\n"
-                f"Agent: {result['agent']}\n"
-                f"Action: {result['action_type']}",
-                parse_mode="Markdown"
-            )
-            logger.info("Approval %s rejected by eric", approval_id)
-        else:
-            await update.message.reply_text(
-                f"❌ Approval `{approval_id}` not found or already processed",
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        logger.error("Reject command failed: %s", e)
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-# ---------------------------------------------------------------------------
-# Mem0 memory layer
-# ---------------------------------------------------------------------------
 
 try:
     from mem0 import Memory
@@ -1673,8 +1599,6 @@ except Exception as e:
     _memory = None
     MEMORY_AVAILABLE = False
     logger.warning("Mem0 unavailable: %s", e)
-
-
 async def get_memories(user_id: str, query: str, limit: int = 6) -> list[str]:
     """Retrieve relevant memories via Mem0 semantic search."""
     if not MEMORY_AVAILABLE or _memory is None:
@@ -1687,8 +1611,6 @@ async def get_memories(user_id: str, query: str, limit: int = 6) -> list[str]:
     except Exception as e:
         logger.warning("Memory retrieval failed: %s", e)
         return []
-
-
 async def remember_fact(user_id: str, fact: str) -> bool:
     """Write a fact directly to Qdrant, bypassing Mem0 LLM extraction.
     Used for explicit Remember: commands — deterministic, never fails due to LLM."""
@@ -1732,8 +1654,6 @@ async def remember_fact(user_id: str, fact: str) -> bool:
     except Exception as e:
         logger.warning("remember_fact failed: %s", e)
         return False
-
-
 async def save_memory(user_id: str, messages: list[dict]) -> None:
     """Extract and save facts from conversation turn via Mem0."""
     if not MEMORY_AVAILABLE or _memory is None:
@@ -1774,8 +1694,6 @@ async def get_pleadly_status() -> dict[str, Any]:
     except Exception as e:
         status["error"] = str(e)
     return status
-
-
 def format_pleadly_status(status: dict[str, Any]) -> str:
     """Format Pleadly status into a readable string for context injection."""
     if not status["reachable"]:
@@ -1853,8 +1771,6 @@ Answer in JSON only, no other text:
     except Exception as e:
         logger.debug("Reflection failed (non-critical): %s", e)
         return {"sufficient": True, "gap": "", "suggestion": ""}
-
-
 async def _critic_pass(
     user_message: str,
     response: str,
@@ -1904,8 +1820,6 @@ Answer in JSON only:
     except Exception as e:
         logger.debug("Critic pass failed (non-critical): %s", e)
         return {"pass": True, "issue": "", "rewrite_instruction": ""}
-
-
 async def chat_with_miko(
     user_message: str,
     user_id: str,
@@ -2136,8 +2050,6 @@ def get_user_id(chat_id: int) -> str:
     if chat_id == DAVID_CHAT_ID:
         return "david"
     return f"user_{chat_id}"
-
-
 def get_principal_context(user_id: str) -> str:
     """Return principal-specific context block injected into system prompt."""
     if user_id == "eric":
@@ -2169,8 +2081,6 @@ You are talking to David. He owns client acquisition, sales, outreach, and deliv
 - Surface anything that affects his pipeline, his outreach, or his client health
 """
     return ""
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming Telegram messages."""
     if not update.message or not update.message.text:
@@ -2203,8 +2113,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         chunks = [reply[i:i+4096] for i in range(0, len(reply), 4096)]
         for chunk in chunks:
             await update.message.reply_text(chunk)
-
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/status — live infrastructure state from master-postgres."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -2221,8 +2129,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         include_pleadly_status=False,
     )
     await update.message.reply_text(reply)
-
-
 async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/brief — morning intelligence brief with infrastructure + inference activity."""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -2247,8 +2153,6 @@ async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     brief = "\n".join(sections)
     await update.message.reply_text(brief)
-
-
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/memory — show what Miko remembers about this user."""
     chat_id = update.effective_chat.id
@@ -2259,8 +2163,6 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     memory_text = "\n".join(f"{i+1}. {m}" for i, m in enumerate(memories))
     await update.message.reply_text(f"What I remember about you:\n\n{memory_text}")
-
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — command list."""
     text = (
@@ -2268,14 +2170,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/brief — morning intelligence brief (infra + inference activity)\n"
         "/status — live Pleadly pipeline status\n"
         "/memory — what I remember about you\n"
-        "/approve <id> — approve pending agent action\n"
-        "/reject <id> — reject pending agent action\n"
         "/help — this list\n\n"
         "Or just talk to me. I'm here."
     )
     await update.message.reply_text(text)
-
-
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_help))
@@ -2283,9 +2181,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("reject", cmd_reject))
-    app.add_handler(CallbackQueryHandler(handle_approval_callback))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback, pattern="^(approve|deny):.+"))
+    app.add_handler(CallbackQueryHandler(handle_approval_queue_callback, pattern="^aq:.+"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     set_tg_bot(app.bot)
     return app
@@ -2298,21 +2195,15 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str = "eric"
     include_status: bool = False
-
-
 class ChatResponse(BaseModel):
     reply: str
     memories_used: int
     timestamp: str
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Miko web backend starting")
     yield
     logger.info("Miko web backend stopping")
-
-
 web_app = FastAPI(title="Miko", lifespan=lifespan)
 web_app.add_middleware(
     CORSMiddleware,
@@ -2320,8 +2211,6 @@ web_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 @web_app.post("/api/chat", response_model=ChatResponse)
 async def api_chat(req: ChatRequest):
     memories = await get_memories(user_id=req.user_id, query=req.message)
@@ -2335,20 +2224,14 @@ async def api_chat(req: ChatRequest):
         memories_used=len(memories),
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
-
-
 @web_app.get("/api/status")
 async def api_status():
     status = await get_pleadly_status()
     return status
-
-
 @web_app.get("/api/memories/{user_id}")
 async def api_memories(user_id: str, query: str = "everything"):
     memories = await get_memories(user_id=user_id, query=query, limit=10)
     return {"user_id": user_id, "memories": memories, "count": len(memories)}
-
-
 @web_app.get("/health")
 async def health():
     return {"status": "ok", "memory": MEMORY_AVAILABLE, "soul_loaded": bool(SOUL)}
@@ -2405,7 +2288,5 @@ async def main():
             approval_task.cancel()
             await tg_app.updater.stop()
             await tg_app.stop()
-
-
 if __name__ == "__main__":
     asyncio.run(main())
